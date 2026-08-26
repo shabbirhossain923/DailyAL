@@ -507,7 +507,9 @@ class DalApi {
   }
 
   Future<String> _getAPIBaseUrl() async =>
-      ((await _dalConfigFuture)?.dalAPIUrl ?? CredMal.apiURL);
+      (CredMal.apiURL.isNotEmpty
+          ? CredMal.apiURL
+          : ((await _dalConfigFuture)?.dalAPIUrl ?? CredMal.apiURL));
 
   Future<void> removeImage(String type, String id) async {
     final baseUrl = await _getAPIBaseUrl();
