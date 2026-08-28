@@ -20,14 +20,14 @@ use axum::{
     Router,
 };
 use futures::lock::Mutex;
+use reqwest;
 use tower_http::cors::CorsLayer;
 
 pub async fn setup_app(config: Config) -> Router {
-    let cache_service = CacheService {
-        config: config.clone(),
-    };
+    let cache_service = CacheService::new(config.clone());
     let mal_api = MalAPI {
         config: config.clone(),
+        client: reqwest::Client::new(),
     };
     let image_service = image_service::ImageService {
         storage_service: FileStorageService {

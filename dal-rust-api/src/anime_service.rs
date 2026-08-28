@@ -31,8 +31,9 @@ impl AnimeService {
             nodes: HashSet::new(),
             edges: Vec::new(),
         };
-        self.get_related_anime_with_graph(id, &mut graph, false, true)
-            .await?;
+        let _ = self
+            .get_related_anime_with_graph(id, &mut graph, false, true)
+            .await;
         return Ok(graph);
     }
 
@@ -44,7 +45,10 @@ impl AnimeService {
         from_cache: bool,
         include_others: bool,
     ) -> Result<(), Box<dyn Error>> {
-        let anime = self.get_anime_by_id(id, from_cache).await.unwrap();
+        let anime = match self.get_anime_by_id(id, from_cache).await {
+            Ok(anime) => anime,
+            Err(_) => return Ok(()),
+        };
         graph.nodes.insert(anime.clone().into());
 
         let unvisited_edges = self.filter_by_nodes(
@@ -60,10 +64,13 @@ impl AnimeService {
                 let combined_edges = Arc::clone(&combined_edges);
                 let combined_anime = Arc::clone(&combined_anime);
                 async move {
-                    let (anime, edges_from_id) = self.get_edges_from_id(edge.target).await;
-                    let mut combined_edges = combined_edges.lock().unwrap();
-                    combined_edges.extend(edges_from_id);
-                    combined_anime.lock().unwrap().push(anime.clone().into());
+                    if let Some((anime, edges_from_id)) =
+                        self.get_edges_from_id(edge.target).await
+                    {
+                        let mut combined_edges = combined_edges.lock().unwrap();
+                        combined_edges.extend(edges_from_id);
+                        combined_anime.lock().unwrap().push(anime.clone().into());
+                    }
                 }
             })
             .await;
@@ -86,10 +93,10 @@ impl AnimeService {
         return Ok(());
     }
 
-    async fn get_edges_from_id(&self, id: i64) -> (Anime, Vec<Edge>) {
-        let anime = self.get_anime_by_id(id, true).await.unwrap();
+    async fn get_edges_from_id(&self, id: i64) -> Option<(Anime, Vec<Edge>)> {
+        let anime = self.get_anime_by_id(id, true).await.ok()?;
         let vec = anime.related_anime.clone();
-        (anime, self.get_unvisited_edges(id, vec, false))
+        Some((anime, self.get_unvisited_edges(id, vec, false)))
     }
 
     fn get_unvisited_edges(

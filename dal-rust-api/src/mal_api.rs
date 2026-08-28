@@ -5,6 +5,7 @@ use crate::reqwest;
 #[derive(Debug, Clone)]
 pub struct MalAPI {
     pub config: Config,
+    pub client: reqwest::Client,
 }
 
 impl MalAPI {
@@ -14,7 +15,7 @@ impl MalAPI {
     ) -> Result<Anime, Box<dyn std::error::Error>> {
         let fields = "?fields=alternative_titles,mean,media_type,status,start_season,related_anime";
         let url = format!("{}/anime/{}{}", self.config.base_url, id, fields);
-        let client = reqwest::Client::new();
+        let client = &self.client;
         let response = client
             .get(&url)
             .header("X-MAL-Client-ID", self.config.secrets.mal_client_id.clone())
