@@ -40,6 +40,7 @@ impl CacheService {
         }
         None
     }
+}
 
 impl CacheService {
     pub async fn check_aws_get_item(&self) -> () {
