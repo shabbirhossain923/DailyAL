@@ -3,12 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::Config;
 use aws_sdk_dynamodb::types::AttributeValue;
+use redis::AsyncCommands;
 use serde::{de::DeserializeOwned, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct CacheService {
     pub config: Config,
     pub mem_cache: Arc<Mutex<HashMap<String, (String, i64)>>>,
+    pub valkey: Arc<Mutex<Option<redis::aio::ConnectionManager>>>,
 }
 
 impl CacheService {
@@ -16,7 +18,68 @@ impl CacheService {
         CacheService {
             config,
             mem_cache: Arc::new(Mutex::new(HashMap::new())),
+            valkey: Arc::new(Mutex::new(None)),
         }
+    }
+
+    async fn valkey_conn(&self) -> Option<redis::aio::ConnectionManager> {
+        let url = self.config.secrets.rediscloud_url.clone();
+        if url.is_empty() || url == "unused" {
+            return None;
+        }
+        {
+            let guard = self.valkey.lock().unwrap();
+            if let Some(cm) = guard.as_ref() {
+                return Some(cm.clone());
+            }
+        }
+        let client = redis::Client::open(url.as_str()).ok()?;
+        let cm = client.get_connection_manager().await.ok()?;
+        let mut guard = self.valkey.lock().unwrap();
+        *guard = Some(cm.clone());
+        Some(cm)
+    }
+
+    async fn valkey_get(&self, key: &str) -> Option<String> {
+        let cm = self.valkey_conn().await?;
+        let mut cm = cm;
+        cm.get::<String, Option<String>>(key.to_string())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn valkey_set(&self, key: String, value: String) {
+        let url = self.config.secrets.rediscloud_url.clone();
+        if url.is_empty() || url == "unused" {
+            return;
+        }
+        let cache = Arc::clone(&self.valkey);
+        tokio::spawn(async move {
+            let cm = {
+                let guard = cache.lock().unwrap();
+                guard.as_ref().cloned()
+            };
+            let cm = match cm {
+                Some(cm) => cm,
+                None => {
+                    let client = match redis::Client::open(url.as_str()) {
+                        Ok(client) => client,
+                        Err(_) => return,
+                    };
+                    match client.get_connection_manager().await {
+                        Ok(cm) => {
+                            let mut guard = cache.lock().unwrap();
+                            *guard = Some(cm.clone());
+                            cm
+                        }
+                        Err(_) => return,
+                    }
+                }
+            };
+            let mut cm = cm;
+            let _ = cm.set::<String, String, ()>(key, value).await;
+        });
     }
 
     fn cache_insert(&self, key: String, value: String, ttl: Option<i64>) {
@@ -93,6 +156,14 @@ impl CacheService {
                 }
             }
         }
+        if let Some(json) = self.valkey_get(&pk).await {
+            if let Ok(value) = serde_json::from_str::<Vec<T>>(&json) {
+                if let Some(first) = value.into_iter().next() {
+                    self.cache_insert(pk.clone(), json, None);
+                    return Some(first);
+                }
+            }
+        }
         let client = self.config.secrets.dynamo_db.clone();
         let result = client
             .get_item()
@@ -138,6 +209,7 @@ impl CacheService {
         let vec_data = vec![data];
         let value = serde_json::to_string(&vec_data).unwrap();
         self.cache_insert(pk.clone(), value.clone(), expiry);
+        self.valkey_set(pk.clone(), value.clone());
         let mut item_builder = self
             .config
             .secrets

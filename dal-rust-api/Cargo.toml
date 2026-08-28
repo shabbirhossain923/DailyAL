@@ -13,6 +13,7 @@ axum-extra = "0.10.3"
 chrono = "0.4.42"
 dotenv = "0.15.0"
 rand_core = "0.9.3"
+redis = { version = "1.6.0", default-features = false, features = ["tokio-native-tls-comp", "connection-manager"] }
 reqwest = { version = "0.12.24", features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
