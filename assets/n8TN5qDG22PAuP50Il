@@ -2,6 +2,6 @@ MAL_CLIENT_ID=4a2616916ea55dd75b7ad461bea38b08
 MAL_CLIENT_SECRET=eda146d87caf3408468d0b1b8dd6d84bad3ae5522a4597c495496e743a38bbce
 APP_CONFIG_URL=https://raw.githubusercontent.com/JICA98/DailyAL/psycho/config
 ERROR_REPORT_URL=
-API_URL=https://REPLACE-ME.onrender.com
+API_URL=https://dal-rust-api-selfhost.onrender.com
 API_SECRET=e1209270059ff66b93cc483f9d8fa8f94db01ef7aefca3132a130a2bcb33aff2
 BUILD_VARIANT=github
