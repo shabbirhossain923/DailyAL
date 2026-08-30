@@ -32,16 +32,13 @@ impl LLMClient {
             "stream": false
         });
 
-        // Retry transient LLM/API failures. 503 is returned by the provider
-        // when the model is temporarily unavailable or under heavy load.
+        // Retry transient provider failures such as 429 and 5xx responses.
         const MAX_ATTEMPTS: usize = 4;
 
-        let (status, text) = loop {
-            let attempt = 1;
-            let mut last_error = None;
+        let text = {
+            let mut final_text = None;
 
-            let mut result = None;
-            for current_attempt in attempt..=MAX_ATTEMPTS {
+            for attempt in 1..=MAX_ATTEMPTS {
                 let response = client
                     .post(api_url)
                     .header("Authorization", format!("Bearer {}", llm_api_key))
@@ -56,50 +53,45 @@ impl LLMClient {
                         let text = res.text().await?;
 
                         if status.is_success() {
-                            result = Some((status, text));
+                            final_text = Some(text);
                             break;
                         }
 
                         let retryable = status.as_u16() == 429 || status.is_server_error();
-                        if !retryable || current_attempt == MAX_ATTEMPTS {
-                            return Err(format!(
-                                "LLM API failed with status {}: {}",
-                                status, text
-                            )
-                            .into());
+                        if !retryable || attempt == MAX_ATTEMPTS {
+                            println!("LLM API failed with status {}: {}", status, text);
+                            return Err(
+                                format!("LLM API failed with status {}: {}", status, text).into()
+                            );
                         }
 
-                        let delay_secs = 2_u64.pow((current_attempt - 1) as u32);
+                        let delay_secs = 2_u64.pow((attempt - 1) as u32);
                         println!(
                             "LLM API returned {} (attempt {}/{}). Retrying in {}s...",
-                            status, current_attempt, MAX_ATTEMPTS, delay_secs
+                            status, attempt, MAX_ATTEMPTS, delay_secs
                         );
                         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                     }
                     Err(e) => {
-                        last_error = Some(e.to_string());
-                        if current_attempt == MAX_ATTEMPTS {
+                        if attempt == MAX_ATTEMPTS {
                             return Err(format!(
                                 "LLM API request failed after {} attempts: {}",
-                                MAX_ATTEMPTS,
-                                last_error.unwrap_or_else(|| "unknown error".to_string())
+                                MAX_ATTEMPTS, e
                             )
                             .into());
                         }
 
-                        let delay_secs = 2_u64.pow((current_attempt - 1) as u32);
+                        let delay_secs = 2_u64.pow((attempt - 1) as u32);
                         println!(
                             "LLM API request error (attempt {}/{}): {}. Retrying in {}s...",
-                            current_attempt, MAX_ATTEMPTS, e, delay_secs
+                            attempt, MAX_ATTEMPTS, e, delay_secs
                         );
                         tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                     }
                 }
             }
 
-            if let Some(result) = result {
-                break result;
-            }
+            final_text.ok_or_else(|| "LLM API request failed without a response".to_string())?
         };
 
         let response: OpenAIResponse = serde_json::from_str(&text)
