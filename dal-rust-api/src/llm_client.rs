@@ -91,7 +91,10 @@ impl LLMClient {
                 }
             }
 
-            final_text.ok_or_else(|| "LLM API request failed without a response".to_string())?
+            match final_text {
+                Some(text) => text,
+                None => return Err(std::io::Error::other("LLM API request failed without a response").into()),
+            }
         };
 
         let response: OpenAIResponse = serde_json::from_str(&text)
