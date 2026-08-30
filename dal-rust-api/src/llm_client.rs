@@ -49,7 +49,7 @@ impl LLMClient {
                 ],
                 "temperature": 0.6,
                 "top_p": 0.7,
-                "max_tokens": 4096,
+                "max_tokens": 1536,
                 "stream": false,
                 "response_format": {"type": "json_object"}
             });
