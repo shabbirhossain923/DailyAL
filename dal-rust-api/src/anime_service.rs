@@ -1,5 +1,5 @@
 use seahash::SeaHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::hash::Hasher;
 use std::sync::{Arc, Mutex};
@@ -34,7 +34,7 @@ impl AnimeService {
         let _ = self
             .get_related_anime_with_graph(id, &mut graph, false, true)
             .await;
-        return Ok(graph);
+        Ok(graph)
     }
 
     #[async_recursion]
@@ -45,52 +45,72 @@ impl AnimeService {
         from_cache: bool,
         include_others: bool,
     ) -> Result<(), Box<dyn Error>> {
-        let anime = match self.get_anime_by_id(id, from_cache).await {
+        // The public method still uses this signature for compatibility, but the
+        // actual traversal is iterative. This prevents deep relation chains from
+        // growing the async call stack and avoids fetching the same MAL ID more
+        // than once when multiple relations point at it.
+        let root = match self.get_anime_by_id(id, from_cache).await {
             Ok(anime) => anime,
             Err(_) => return Ok(()),
         };
-        graph.nodes.insert(anime.clone().into());
 
-        let unvisited_edges = self.filter_by_nodes(
-            self.get_unvisited_edges(id, anime.related_anime.clone(), include_others),
-            &graph.nodes,
-        );
+        graph.nodes.insert(root.clone().into());
 
-        let combined_edges: Arc<Mutex<Vec<Edge>>> = Arc::new(Mutex::new(Vec::new()));
-        let combined_anime: Arc<Mutex<Vec<ContentNodeDTO>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut visited: HashSet<i64> = HashSet::new();
+        visited.insert(id);
+        let mut queue: VecDeque<(i64, bool)> = VecDeque::new();
+        queue.push_back((id, include_others));
 
-        stream::iter(unvisited_edges.clone())
-            .for_each_concurrent(5, |edge| {
-                let combined_edges = Arc::clone(&combined_edges);
-                let combined_anime = Arc::clone(&combined_anime);
-                async move {
-                    if let Some((anime, edges_from_id)) =
-                        self.get_edges_from_id(edge.target).await
-                    {
-                        let mut combined_edges = combined_edges.lock().unwrap();
-                        combined_edges.extend(edges_from_id);
-                        combined_anime.lock().unwrap().push(anime.clone().into());
+        while !queue.is_empty() {
+            // Take a bounded batch so a large franchise does not create an
+            // unbounded number of simultaneous MAL requests.
+            let mut batch = Vec::with_capacity(5);
+            while batch.len() < 5 {
+                let Some((current_id, current_include_others)) = queue.pop_front() else {
+                    break;
+                };
+                batch.push((current_id, current_include_others));
+            }
+
+            let results = stream::iter(batch)
+                .map(|(current_id, current_include_others)| async move {
+                    let anime = match self.get_anime_by_id(current_id, true).await {
+                        Ok(anime) => anime,
+                        Err(_) => return None,
+                    };
+                    let edges = self.get_unvisited_edges(
+                        current_id,
+                        anime.related_anime.clone(),
+                        current_include_others,
+                    );
+                    Some((anime, edges))
+                })
+                .buffer_unordered(5)
+                .collect::<Vec<_>>()
+                .await;
+
+            for result in results.into_iter().flatten() {
+                let (anime, edges) = result;
+                graph.nodes.insert(anime.clone().into());
+
+                for edge in edges {
+                    // Record each edge once and only schedule a target once.
+                    if !graph.edges.iter().any(|existing| {
+                        existing.source == edge.source
+                            && existing.target == edge.target
+                            && existing.relation_type == edge.relation_type
+                    }) {
+                        graph.edges.push(edge.clone().into());
+                    }
+
+                    if visited.insert(edge.target) {
+                        queue.push_back((edge.target, false));
                     }
                 }
-            })
-            .await;
-
-        graph
-            .edges
-            .extend(unvisited_edges.iter().map(|e| e.clone().into()));
-        graph
-            .nodes
-            .extend(combined_anime.lock().unwrap().clone().into_iter());
-        let filter_by_nodes =
-            self.filter_by_nodes(combined_edges.lock().unwrap().clone(), &graph.nodes);
-
-        for edge in filter_by_nodes.iter() {
-            graph.edges.push(edge.clone().into());
-            let _ = self
-                .get_related_anime_with_graph(edge.target, graph, true, false)
-                .await;
+            }
         }
-        return Ok(());
+
+        Ok(())
     }
 
     async fn get_edges_from_id(&self, id: i64) -> Option<(Anime, Vec<Edge>)> {
@@ -106,10 +126,9 @@ impl AnimeService {
         include_others: bool,
     ) -> Vec<Edge> {
         let mut unvisited_edges: Vec<Edge> = Vec::new();
-        if related_anime.is_some() {
+        if let Some(related_anime) = related_anime {
             unvisited_edges.extend(
                 related_anime
-                    .unwrap()
                     .iter()
                     .filter(|related_anime| {
                         self.valid_relation(&related_anime.relation_type, include_others)
@@ -118,8 +137,7 @@ impl AnimeService {
                         source: id,
                         target: related_anime.node.id,
                         relation_type: related_anime.relation_type.clone(),
-                    })
-                    .collect::<Vec<Edge>>(),
+                    }),
             );
         }
         unvisited_edges
@@ -134,7 +152,7 @@ impl AnimeService {
                     ..Default::default()
                 })
             })
-            .map(|e| e.clone())
+            .cloned()
             .collect()
     }
 
@@ -171,10 +189,7 @@ impl AnimeService {
                 now.format("%d/%m/%Y %H:%M:%S"),
                 id
             );
-            // If the anime is not in the cache, get it from the MAL API
             let anime = self.mal_api.get_anime_details(id).await?;
-
-            // Store the anime in the cache for future use
             self.cache_service
                 .set_cache_by_id("anime", id.to_string(), &anime, None)
                 .await;
@@ -230,18 +245,17 @@ impl AnimeService {
 
         if cached_review.is_some() {
             return Ok(cached_review.unwrap());
-        } else {
-            println!("Cache miss for {}", hash_str);
-            let json_str = self.ai_service.talk(REVIEW_SYSTEM, reviews).await?;
-            let review_response_data: ReviewResponseData = serde_json::from_str(&json_str)?;
-
-            let review_response = review_response_data.data.clone();
-
-            self.cache_service
-                .set_cache_by_id("reviews", hash_str, &review_response, Some(3600 * 24 * 30))
-                .await;
-            return Ok(review_response);
         }
+
+        println!("Cache miss for {}", hash_str);
+        let json_str = self.ai_service.talk(REVIEW_SYSTEM, reviews).await?;
+        let review_response_data: ReviewResponseData = serde_json::from_str(&json_str)?;
+        let review_response = review_response_data.data.clone();
+
+        self.cache_service
+            .set_cache_by_id("reviews", hash_str, &review_response, Some(3600 * 24 * 30))
+            .await;
+        Ok(review_response)
     }
 
     pub async fn get_anime(&self, query: AnimeQuery) -> Vec<HashMap<String, String>> {
@@ -263,7 +277,7 @@ impl AnimeService {
     async fn get_anime_by_mal_id(&self, query: &AnimeQuery) -> Vec<AnimeLink> {
         let mal_id = &query.mal_id.clone().unwrap().clone();
         let anime_link: AnimeLink = self.anime_link_service.get_link_by_id(mal_id).await;
-        return Vec::from([anime_link]);
+        Vec::from([anime_link])
     }
 
     async fn get_anime_by_query(&self, query: &AnimeQuery) -> Vec<AnimeLink> {
@@ -282,60 +296,39 @@ fn create_map_using_fields(
             match field.as_str() {
                 "title" => {
                     if anime.title.is_some() {
-                        hash_map
-                            .insert("title".to_string(), anime.title.clone().unwrap_or_default());
+                        hash_map.insert("title".to_string(), anime.title.clone().unwrap_or_default());
                     }
                 }
                 "malId" => {
                     if anime.mal_id.is_some() {
-                        hash_map.insert(
-                            "malId".to_string(),
-                            anime.mal_id.clone().unwrap_or_default(),
-                        );
+                        hash_map.insert("malId".to_string(), anime.mal_id.clone().unwrap_or_default());
                     }
                 }
                 "anilistId" => {
                     if anime.anilist_id.is_some() {
-                        hash_map.insert(
-                            "anilistId".to_string(),
-                            anime.anilist_id.clone().unwrap_or_default(),
-                        );
+                        hash_map.insert("anilistId".to_string(), anime.anilist_id.clone().unwrap_or_default());
                     }
                 }
                 "kitsuId" => {
                     if anime.kitsu_id.is_some() {
-                        hash_map.insert(
-                            "kitsuId".to_string(),
-                            anime.kitsu_id.clone().unwrap_or_default(),
-                        );
+                        hash_map.insert("kitsuId".to_string(), anime.kitsu_id.clone().unwrap_or_default());
                     }
                 }
                 "animePlanet" => {
                     if anime.anime_planet.is_some() {
-                        hash_map.insert(
-                            "animePlanet".to_string(),
-                            anime.anime_planet.clone().unwrap_or_default(),
-                        );
+                        hash_map.insert("animePlanet".to_string(), anime.anime_planet.clone().unwrap_or_default());
                     }
                 }
                 "picture" => {
                     if anime.picture.is_some() {
-                        hash_map.insert(
-                            "picture".to_string(),
-                            anime.picture.clone().unwrap_or_default(),
-                        );
+                        hash_map.insert("picture".to_string(), anime.picture.clone().unwrap_or_default());
                     }
                 }
                 "synonyms" => {
                     if anime.synonyms.is_some() {
                         hash_map.insert(
                             "synonyms".to_string(),
-                            anime
-                                .synonyms
-                                .clone()
-                                .unwrap_or_default()
-                                .join(",")
-                                .to_string(),
+                            anime.synonyms.clone().unwrap_or_default().join(",").to_string(),
                         );
                     }
                 }
