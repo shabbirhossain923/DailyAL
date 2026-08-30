@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::model::Anime;
 use crate::reqwest;
 use std::error::Error;
+use std::io;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -39,7 +40,11 @@ impl MalAPI {
 
             if status.is_success() {
                 return serde_json::from_str(&body).map_err(|error| {
-                    format!("MAL returned invalid JSON for anime {}: {}", id, error).into()
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("MAL returned invalid JSON for anime {}: {}", id, error),
+                    )
+                    .into()
                 });
             }
 
@@ -58,11 +63,14 @@ impl MalAPI {
             }
 
             let body_preview: String = body.chars().take(300).collect();
-            return Err(format!(
-                "MAL API error for anime {}: HTTP {} - {}",
-                id,
-                status.as_u16(),
-                body_preview
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "MAL API error for anime {}: HTTP {} - {}",
+                    id,
+                    status.as_u16(),
+                    body_preview
+                ),
             )
             .into());
         }
