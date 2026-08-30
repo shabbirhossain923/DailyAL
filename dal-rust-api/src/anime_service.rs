@@ -31,10 +31,15 @@ impl AnimeService {
             nodes: HashSet::new(),
             edges: Vec::new(),
         };
-        let _ = self
-            .get_related_anime_with_graph(id, &mut graph, false, true)
-            .await;
-        return Ok(graph);
+        self.get_related_anime_with_graph(id, &mut graph, false, true)
+            .await?;
+        println!(
+            "Graph request completed for anime {}: {} nodes, {} edges",
+            id,
+            graph.nodes.len(),
+            graph.edges.len()
+        );
+        Ok(graph)
     }
 
     #[async_recursion]
@@ -47,7 +52,10 @@ impl AnimeService {
     ) -> Result<(), Box<dyn Error>> {
         let anime = match self.get_anime_by_id(id, from_cache).await {
             Ok(anime) => anime,
-            Err(_) => return Ok(()),
+            Err(error) => {
+                println!("Graph anime fetch failed for {}: {}", id, error);
+                return Ok(());
+            }
         };
         graph.nodes.insert(anime.clone().into());
 
@@ -56,33 +64,41 @@ impl AnimeService {
             &graph.nodes,
         );
 
-        let combined_edges: Arc<Mutex<Vec<Edge>>> = Arc::new(Mutex::new(Vec::new()));
-        let combined_anime: Arc<Mutex<Vec<ContentNodeDTO>>> = Arc::new(Mutex::new(Vec::new()));
+        // Requests are still concurrent for speed, but their results are explicitly
+        // restored to the original relation order before they are added to the graph.
+        // This prevents GraphView/Sugiyama from receiving a different edge insertion
+        // order depending on which MAL request happens to finish first.
+        let mut fetched_results = stream::iter(
+            unvisited_edges
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, edge)| async move {
+                    let result = self.get_edges_from_id(edge.target).await;
+                    (index, result)
+                }),
+        )
+        .buffer_unordered(5)
+        .collect::<Vec<_>>()
+        .await;
 
-        stream::iter(unvisited_edges.clone())
-            .for_each_concurrent(5, |edge| {
-                let combined_edges = Arc::clone(&combined_edges);
-                let combined_anime = Arc::clone(&combined_anime);
-                async move {
-                    if let Some((anime, edges_from_id)) =
-                        self.get_edges_from_id(edge.target).await
-                    {
-                        let mut combined_edges = combined_edges.lock().unwrap();
-                        combined_edges.extend(edges_from_id);
-                        combined_anime.lock().unwrap().push(anime.clone().into());
-                    }
-                }
-            })
-            .await;
+        fetched_results.sort_by_key(|(index, _)| *index);
+
+        let mut combined_edges = Vec::new();
+        let mut combined_anime = Vec::new();
+        for (_, result) in fetched_results {
+            if let Some((anime, edges_from_id)) = result {
+                combined_edges.extend(edges_from_id);
+                combined_anime.push(anime.into());
+            }
+        }
 
         graph
             .edges
-            .extend(unvisited_edges.iter().map(|e| e.clone().into()));
-        graph
-            .nodes
-            .extend(combined_anime.lock().unwrap().clone().into_iter());
-        let filter_by_nodes =
-            self.filter_by_nodes(combined_edges.lock().unwrap().clone(), &graph.nodes);
+            .extend(unvisited_edges.iter().cloned().map(Into::into));
+        graph.nodes.extend(combined_anime.into_iter());
+
+        let filter_by_nodes = self.filter_by_nodes(combined_edges, &graph.nodes);
 
         for edge in filter_by_nodes.iter() {
             graph.edges.push(edge.clone().into());
@@ -90,7 +106,7 @@ impl AnimeService {
                 .get_related_anime_with_graph(edge.target, graph, true, false)
                 .await;
         }
-        return Ok(());
+        Ok(())
     }
 
     async fn get_edges_from_id(&self, id: i64) -> Option<(Anime, Vec<Edge>)> {
@@ -106,10 +122,9 @@ impl AnimeService {
         include_others: bool,
     ) -> Vec<Edge> {
         let mut unvisited_edges: Vec<Edge> = Vec::new();
-        if related_anime.is_some() {
+        if let Some(related_anime) = related_anime {
             unvisited_edges.extend(
                 related_anime
-                    .unwrap()
                     .iter()
                     .filter(|related_anime| {
                         self.valid_relation(&related_anime.relation_type, include_others)
@@ -118,8 +133,7 @@ impl AnimeService {
                         source: id,
                         target: related_anime.node.id,
                         relation_type: related_anime.relation_type.clone(),
-                    })
-                    .collect::<Vec<Edge>>(),
+                    }),
             );
         }
         unvisited_edges
@@ -134,7 +148,7 @@ impl AnimeService {
                     ..Default::default()
                 })
             })
-            .map(|e| e.clone())
+            .cloned()
             .collect()
     }
 
@@ -171,10 +185,8 @@ impl AnimeService {
                 now.format("%d/%m/%Y %H:%M:%S"),
                 id
             );
-            // If the anime is not in the cache, get it from the MAL API
             let anime = self.mal_api.get_anime_details(id).await?;
 
-            // Store the anime in the cache for future use
             self.cache_service
                 .set_cache_by_id("anime", id.to_string(), &anime, None)
                 .await;
@@ -260,97 +272,73 @@ impl AnimeService {
         self.anime_link_service.get_all_anime().await
     }
 
-    async fn get_anime_by_mal_id(&self, query: &AnimeQuery) -> Vec<AnimeLink> {
-        let mal_id = &query.mal_id.clone().unwrap().clone();
-        let anime_link: AnimeLink = self.anime_link_service.get_link_by_id(mal_id).await;
-        return Vec::from([anime_link]);
-    }
-
     async fn get_anime_by_query(&self, query: &AnimeQuery) -> Vec<AnimeLink> {
         self.anime_link_service.search(query).await
+    }
+
+    async fn get_anime_by_mal_id(&self, query: &AnimeQuery) -> Vec<AnimeLink> {
+        let mal_id = query.mal_id.clone().unwrap();
+        vec![self.anime_link_service.get_link_by_id(&mal_id).await]
     }
 }
 
 fn create_map_using_fields(
-    link: Vec<AnimeLink>,
+    links: Vec<AnimeLink>,
     fields: &Vec<String>,
 ) -> Vec<HashMap<String, String>> {
-    let mut map: Vec<HashMap<String, String>> = Vec::new();
-    for anime in &link {
-        let mut hash_map: HashMap<String, String> = HashMap::new();
-        for field in fields.iter() {
-            match field.as_str() {
-                "title" => {
-                    if anime.title.is_some() {
-                        hash_map
-                            .insert("title".to_string(), anime.title.clone().unwrap_or_default());
+    links
+        .iter()
+        .map(|link| {
+            let mut map = HashMap::new();
+            for field in fields {
+                match field.as_str() {
+                    "title" => {
+                        if let Some(title) = &link.title {
+                            map.insert("title".to_string(), title.to_string());
+                        }
                     }
-                }
-                "malId" => {
-                    if anime.mal_id.is_some() {
-                        hash_map.insert(
-                            "malId".to_string(),
-                            anime.mal_id.clone().unwrap_or_default(),
-                        );
+                    "picture" => {
+                        if let Some(picture) = &link.picture {
+                            map.insert("picture".to_string(), picture.to_string());
+                        }
                     }
-                }
-                "anilistId" => {
-                    if anime.anilist_id.is_some() {
-                        hash_map.insert(
-                            "anilistId".to_string(),
-                            anime.anilist_id.clone().unwrap_or_default(),
-                        );
+                    "year" => {
+                        if let Some(year) = &link.year {
+                            map.insert("year".to_string(), year.to_string());
+                        }
                     }
-                }
-                "kitsuId" => {
-                    if anime.kitsu_id.is_some() {
-                        hash_map.insert(
-                            "kitsuId".to_string(),
-                            anime.kitsu_id.clone().unwrap_or_default(),
-                        );
+                    "synonyms" => {
+                        if let Some(synonyms) = &link.synonyms {
+                            map.insert("synonyms".to_string(), synonyms.join(","));
+                        }
                     }
-                }
-                "animePlanet" => {
-                    if anime.anime_planet.is_some() {
-                        hash_map.insert(
-                            "animePlanet".to_string(),
-                            anime.anime_planet.clone().unwrap_or_default(),
-                        );
+                    "malId" => {
+                        if let Some(mal_id) = &link.mal_id {
+                            map.insert("malId".to_string(), mal_id.to_string());
+                        }
                     }
-                }
-                "picture" => {
-                    if anime.picture.is_some() {
-                        hash_map.insert(
-                            "picture".to_string(),
-                            anime.picture.clone().unwrap_or_default(),
-                        );
+                    "anilistId" => {
+                        if let Some(anilist_id) = &link.anilist_id {
+                            map.insert("anilistId".to_string(), anilist_id.to_string());
+                        }
                     }
-                }
-                "synonyms" => {
-                    if anime.synonyms.is_some() {
-                        hash_map.insert(
-                            "synonyms".to_string(),
-                            anime
-                                .synonyms
-                                .clone()
-                                .unwrap_or_default()
-                                .join(",")
-                                .to_string(),
-                        );
+                    "kitsuId" => {
+                        if let Some(kitsu_id) = &link.kitsu_id {
+                            map.insert("kitsuId".to_string(), kitsu_id.to_string());
+                        }
                     }
-                }
-                "year" => {
-                    if anime.year.is_some() {
-                        hash_map.insert("year".to_string(), anime.year.clone().unwrap_or_default());
+                    "animePlanet" => {
+                        if let Some(anime_planet) = &link.anime_planet {
+                            map.insert("animePlanet".to_string(), anime_planet.to_string());
+                        }
                     }
+                    "mean" => {
+                        map.insert("mean".to_string(), link.mean.to_string());
+                    }
+                    _ => {}
                 }
-                "mean" => {
-                    hash_map.insert("mean".to_string(), anime.mean.to_string());
-                }
-                _ => {}
             }
-        }
-        map.push(hash_map);
-    }
-    map
+            map
+        })
+        .collect()
 }
