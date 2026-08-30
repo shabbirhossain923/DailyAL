@@ -31,9 +31,12 @@ impl AnimeService {
             nodes: HashSet::new(),
             edges: Vec::new(),
         };
-        let _ = self
-            .get_related_anime_with_graph(id, &mut graph, false, true)
-            .await;
+
+        // A root failure is a real graph error. Do not hide it as an empty
+        // graph, otherwise the client only sees a misleading "No Content".
+        self.get_related_anime_with_graph(id, &mut graph, false, true)
+            .await?;
+
         Ok(graph)
     }
 
@@ -48,10 +51,7 @@ impl AnimeService {
         // Keep the public method signature for compatibility, but use an
         // iterative breadth-first traversal so deep/large franchises do not
         // grow the async call stack and duplicate targets are fetched once.
-        let root = match self.get_anime_by_id(id, from_cache).await {
-            Ok(anime) => anime,
-            Err(_) => return Ok(()),
-        };
+        let root = self.get_anime_by_id(id, from_cache).await?;
 
         graph.nodes.insert(root.into());
 
@@ -61,23 +61,36 @@ impl AnimeService {
         queue.push_back((id, include_others));
 
         while !queue.is_empty() {
-            let mut batch = Vec::with_capacity(5);
-            while batch.len() < 5 {
+            // Keep the MAL request burst deliberately small. A large
+            // franchise can otherwise trigger MAL's rate limiter before the
+            // retry logic in MalAPI gets a chance to recover.
+            let mut batch = Vec::with_capacity(2);
+            while batch.len() < 2 {
                 let Some(item) = queue.pop_front() else { break };
                 batch.push(item);
             }
 
             let results = stream::iter(batch)
                 .map(|(current_id, current_include_others)| async move {
-                    let anime = self.get_anime_by_id(current_id, true).await.ok()?;
-                    let edges = self.get_unvisited_edges(
-                        current_id,
-                        anime.related_anime.clone(),
-                        current_include_others,
-                    );
-                    Some((anime, edges))
+                    match self.get_anime_by_id(current_id, true).await {
+                        Ok(anime) => {
+                            let edges = self.get_unvisited_edges(
+                                current_id,
+                                anime.related_anime.clone(),
+                                current_include_others,
+                            );
+                            Some((anime, edges))
+                        }
+                        Err(error) => {
+                            println!(
+                                "Graph node fetch failed for anime {}: {}",
+                                current_id, error
+                            );
+                            None
+                        }
+                    }
                 })
-                .buffer_unordered(5)
+                .buffer_unordered(2)
                 .collect::<Vec<_>>()
                 .await;
 
