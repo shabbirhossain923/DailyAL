@@ -2,16 +2,12 @@ use seahash::SeaHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::hash::Hasher;
-use std::sync::{Arc, Mutex};
-
 use crate::model::{
     Anime, AnimeLink, AnimeQuery, Edge, RelatedAnime, RelationType, ReviewResponse,
     ReviewResponseData,
 };
-
 use crate::config::Config;
 use crate::model_dto::{ContentGraphDTO, ContentNodeDTO};
-use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt};
 
@@ -28,6 +24,12 @@ Rules:
 - If there are no meaningful pros or cons, use an empty array for that list.
 - Do not wrap the JSON in Markdown code fences."#;
 
+// Graphs are cached independently from anime details. Bumping this version
+// invalidates graphs produced by an older traversal/layout algorithm.
+const GRAPH_CACHE_TYPE: &str = "anime_graph_v2";
+const GRAPH_CACHE_TTL_SECS: i64 = 60 * 60 * 24;
+const GRAPH_FETCH_CONCURRENCY: usize = 6;
+
 pub struct AnimeService {
     pub config: Config,
     pub mal_api: crate::mal_api::MalAPI,
@@ -38,57 +40,57 @@ pub struct AnimeService {
 
 impl AnimeService {
     pub async fn get_related_anime(&self, id: i64) -> Result<ContentGraphDTO, Box<dyn Error>> {
+        if let Some(cached_graph) = self
+            .cache_service
+            .get_cache_by_id::<ContentGraphDTO>(GRAPH_CACHE_TYPE, id.to_string())
+            .await
+        {
+            println!("Graph cache hit for anime {}", id);
+            return Ok(cached_graph);
+        }
+
+        println!("Graph cache miss for anime {}", id);
+
+        let root = self.get_anime_by_id(id, true).await?;
         let mut graph = ContentGraphDTO {
             nodes: HashSet::new(),
             edges: Vec::new(),
         };
-
-        // A root failure is a real graph error. Do not hide it as an empty
-        // graph, otherwise the client only sees a misleading "No Content".
-        self.get_related_anime_with_graph(id, &mut graph, false, true)
-            .await?;
-
-        Ok(graph)
-    }
-
-    #[async_recursion]
-    pub async fn get_related_anime_with_graph(
-        &self,
-        id: i64,
-        graph: &mut ContentGraphDTO,
-        from_cache: bool,
-        include_others: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        // Keep the public method signature for compatibility, but use an
-        // iterative breadth-first traversal so deep/large franchises do not
-        // grow the async call stack and duplicate targets are fetched once.
-        let root = self.get_anime_by_id(id, from_cache).await?;
-
-        graph.nodes.insert(root.into());
+        graph.nodes.insert(root.clone().into());
 
         let mut visited: HashSet<i64> = HashSet::new();
         visited.insert(id);
-        let mut queue: VecDeque<(i64, bool)> = VecDeque::new();
-        queue.push_back((id, include_others));
+
+        // Process the root immediately. The previous implementation put the
+        // root back into the queue, causing an unnecessary second MAL request.
+        let root_edges = self.get_unvisited_edges(id, root.related_anime.clone(), true);
+        let mut queue: VecDeque<i64> = VecDeque::new();
+        for edge in root_edges {
+            if visited.insert(edge.target) {
+                graph.edges.push(edge.clone().into());
+                queue.push_back(edge.target);
+            }
+        }
 
         while !queue.is_empty() {
-            // Keep the MAL request burst deliberately small. A large
-            // franchise can otherwise trigger MAL's rate limiter before the
-            // retry logic in MalAPI gets a chance to recover.
-            let mut batch = Vec::with_capacity(2);
-            while batch.len() < 2 {
-                let Some(item) = queue.pop_front() else { break };
-                batch.push(item);
+            let mut batch = Vec::with_capacity(GRAPH_FETCH_CONCURRENCY);
+            while batch.len() < GRAPH_FETCH_CONCURRENCY {
+                let Some(current_id) = queue.pop_front() else { break };
+                batch.push(current_id);
             }
 
+            // `buffered` preserves the queue order while allowing several MAL
+            // requests to be in flight at once. Six concurrent requests cuts
+            // the number of sequential rounds substantially without creating
+            // an unnecessarily large burst that is likely to trigger 429s.
             let results = stream::iter(batch)
-                .map(|(current_id, current_include_others)| async move {
+                .map(|current_id| async move {
                     match self.get_anime_by_id(current_id, true).await {
                         Ok(anime) => {
                             let edges = self.get_unvisited_edges(
                                 current_id,
                                 anime.related_anime.clone(),
-                                current_include_others,
+                                false,
                             );
                             Some((anime, edges))
                         }
@@ -101,7 +103,7 @@ impl AnimeService {
                         }
                     }
                 })
-                .buffer_unordered(2)
+                .buffered(GRAPH_FETCH_CONCURRENCY)
                 .collect::<Vec<_>>()
                 .await;
 
@@ -110,18 +112,100 @@ impl AnimeService {
                 graph.nodes.insert(anime.into());
 
                 for edge in edges {
-                    // The API DTO does not implement PartialEq for relation
-                    // types, so deduplicate by the relation endpoints.
                     if !graph.edges.iter().any(|existing| {
                         existing.source == edge.source && existing.target == edge.target
                     }) {
                         graph.edges.push(edge.clone().into());
                     }
 
-                    // Mark a target visited before fetching it. This prevents
-                    // duplicate requests when several nodes point to it.
                     if visited.insert(edge.target) {
-                        queue.push_back((edge.target, false));
+                        queue.push_back(edge.target);
+                    }
+                }
+            }
+        }
+
+        self.cache_service
+            .set_cache_by_id(
+                GRAPH_CACHE_TYPE,
+                id.to_string(),
+                &graph,
+                Some(GRAPH_CACHE_TTL_SECS),
+            )
+            .await;
+
+        println!(
+            "Graph cached for anime {}: {} nodes, {} edges",
+            id,
+            graph.nodes.len(),
+            graph.edges.len()
+        );
+
+        Ok(graph)
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_related_anime_with_graph(
+        &self,
+        id: i64,
+        graph: &mut ContentGraphDTO,
+        from_cache: bool,
+        include_others: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let root = self.get_anime_by_id(id, from_cache).await?;
+        graph.nodes.insert(root.clone().into());
+
+        let mut visited: HashSet<i64> = graph
+            .nodes
+            .iter()
+            .map(|node| node.id)
+            .collect();
+        visited.insert(id);
+        let mut queue: VecDeque<i64> = VecDeque::new();
+
+        for edge in self.get_unvisited_edges(id, root.related_anime.clone(), include_others) {
+            if visited.insert(edge.target) {
+                graph.edges.push(edge.clone().into());
+                queue.push_back(edge.target);
+            }
+        }
+
+        while !queue.is_empty() {
+            let mut batch = Vec::with_capacity(GRAPH_FETCH_CONCURRENCY);
+            while batch.len() < GRAPH_FETCH_CONCURRENCY {
+                let Some(current_id) = queue.pop_front() else { break };
+                batch.push(current_id);
+            }
+
+            let results = stream::iter(batch)
+                .map(|current_id| async move {
+                    match self.get_anime_by_id(current_id, true).await {
+                        Ok(anime) => Some((current_id, anime)),
+                        Err(error) => {
+                            println!("Graph node fetch failed for anime {}: {}", current_id, error);
+                            None
+                        }
+                    }
+                })
+                .buffered(GRAPH_FETCH_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+
+            for result in results.into_iter().flatten() {
+                let (current_id, anime) = result;
+                graph.nodes.insert(anime.clone().into());
+                for edge in self.get_unvisited_edges(
+                    current_id,
+                    anime.related_anime.clone(),
+                    false,
+                ) {
+                    if !graph.edges.iter().any(|existing| {
+                        existing.source == edge.source && existing.target == edge.target
+                    }) {
+                        graph.edges.push(edge.clone().into());
+                    }
+                    if visited.insert(edge.target) {
+                        queue.push_back(edge.target);
                     }
                 }
             }
@@ -191,13 +275,12 @@ impl AnimeService {
 
     async fn get_anime_by_id(&self, id: i64, from_cache: bool) -> Result<Anime, Box<dyn Error>> {
         let now = chrono::Utc::now();
-        let result = match from_cache {
-            true => {
-                self.cache_service
-                    .get_cache_by_id("anime", id.to_string())
-                    .await
-            }
-            false => None,
+        let result = if from_cache {
+            self.cache_service
+                .get_cache_by_id("anime", id.to_string())
+                .await
+        } else {
+            None
         };
 
         if result.is_none() {
@@ -221,13 +304,7 @@ impl AnimeService {
         }
     }
 
-    fn log_anime(
-        &self,
-        anime: &Anime,
-        hit_or_miss: String,
-        then: DateTime<Utc>,
-        now: DateTime<Utc>,
-    ) {
+    fn log_anime(&self, anime: &Anime, hit_or_miss: String, then: DateTime<Utc>, now: DateTime<Utc>) {
         println!(
             "{}: {} anime: {} and {} in {}ms",
             then.format("%d/%m/%Y %H:%M:%S"),
@@ -250,16 +327,13 @@ impl AnimeService {
         reviews: &str,
     ) -> Result<ReviewResponse, Box<dyn Error + Send + Sync>> {
         println!("Summarizing review {}", reviews.len());
-
         let hash_str = self.hash_str(reviews);
-
         println!("Using hash_key: {}", hash_str);
 
         let cached_review: Option<ReviewResponse> = self
             .cache_service
             .get_cache_by_id("reviews", hash_str.clone())
             .await;
-
         if cached_review.is_some() {
             return Ok(cached_review.unwrap());
         }
@@ -302,61 +376,21 @@ impl AnimeService {
     }
 }
 
-fn create_map_using_fields(
-    link: Vec<AnimeLink>,
-    fields: &Vec<String>,
-) -> Vec<HashMap<String, String>> {
+fn create_map_using_fields(link: Vec<AnimeLink>, fields: &Vec<String>) -> Vec<HashMap<String, String>> {
     let mut map: Vec<HashMap<String, String>> = Vec::new();
     for anime in &link {
         let mut hash_map: HashMap<String, String> = HashMap::new();
         for field in fields.iter() {
             match field.as_str() {
-                "title" => {
-                    if anime.title.is_some() {
-                        hash_map.insert("title".to_string(), anime.title.clone().unwrap_or_default());
-                    }
-                }
-                "malId" => {
-                    if anime.mal_id.is_some() {
-                        hash_map.insert("malId".to_string(), anime.mal_id.clone().unwrap_or_default());
-                    }
-                }
-                "anilistId" => {
-                    if anime.anilist_id.is_some() {
-                        hash_map.insert("anilistId".to_string(), anime.anilist_id.clone().unwrap_or_default());
-                    }
-                }
-                "kitsuId" => {
-                    if anime.kitsu_id.is_some() {
-                        hash_map.insert("kitsuId".to_string(), anime.kitsu_id.clone().unwrap_or_default());
-                    }
-                }
-                "animePlanet" => {
-                    if anime.anime_planet.is_some() {
-                        hash_map.insert("animePlanet".to_string(), anime.anime_planet.clone().unwrap_or_default());
-                    }
-                }
-                "picture" => {
-                    if anime.picture.is_some() {
-                        hash_map.insert("picture".to_string(), anime.picture.clone().unwrap_or_default());
-                    }
-                }
-                "synonyms" => {
-                    if anime.synonyms.is_some() {
-                        hash_map.insert(
-                            "synonyms".to_string(),
-                            anime.synonyms.clone().unwrap_or_default().join(",").to_string(),
-                        );
-                    }
-                }
-                "year" => {
-                    if anime.year.is_some() {
-                        hash_map.insert("year".to_string(), anime.year.clone().unwrap_or_default());
-                    }
-                }
-                "mean" => {
-                    hash_map.insert("mean".to_string(), anime.mean.to_string());
-                }
+                "title" => { if anime.title.is_some() { hash_map.insert("title".to_string(), anime.title.clone().unwrap_or_default()); } }
+                "malId" => { if anime.mal_id.is_some() { hash_map.insert("malId".to_string(), anime.mal_id.clone().unwrap_or_default()); } }
+                "anilistId" => { if anime.anilist_id.is_some() { hash_map.insert("anilistId".to_string(), anime.anilist_id.clone().unwrap_or_default()); } }
+                "kitsuId" => { if anime.kitsu_id.is_some() { hash_map.insert("kitsuId".to_string(), anime.kitsu_id.clone().unwrap_or_default()); } }
+                "animePlanet" => { if anime.anime_planet.is_some() { hash_map.insert("animePlanet".to_string(), anime.anime_planet.clone().unwrap_or_default()); } }
+                "picture" => { if anime.picture.is_some() { hash_map.insert("picture".to_string(), anime.picture.clone().unwrap_or_default()); } }
+                "synonyms" => { if anime.synonyms.is_some() { hash_map.insert("synonyms".to_string(), anime.synonyms.clone().unwrap_or_default().join(",").to_string()); } }
+                "year" => { if anime.year.is_some() { hash_map.insert("year".to_string(), anime.year.clone().unwrap_or_default()); } }
+                "mean" => { hash_map.insert("mean".to_string(), anime.mean.to_string()); }
                 _ => {}
             }
         }
