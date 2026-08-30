@@ -7,6 +7,7 @@ use crate::{
     model_dto::ContentGraphDTO,
     AppState,
 };
+use crate::anime_graph_service;
 
 use axum::{
     extract::{Multipart, Path, State},
@@ -22,7 +23,7 @@ pub async fn get_related_anime(
 ) -> Result<Json<ContentGraphDTO>, (StatusCode, String)> {
     println!("Graph request started for anime {}", mal_id);
 
-    match data.anime_service.get_related_anime(mal_id).await {
+    match anime_graph_service::get_related_anime(&data.anime_service, mal_id).await {
         Ok(graph) => {
             println!(
                 "Graph request completed for anime {}: {} nodes, {} edges",
