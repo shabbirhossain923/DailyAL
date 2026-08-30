@@ -5,18 +5,21 @@ use futures::{stream, StreamExt};
 
 use crate::anime_service::AnimeService;
 use crate::model::{Anime, Edge, RelatedAnime, RelationType};
-use crate::model_dto::{ContentGraphDTO, ContentNodeDTO};
+use crate::model_dto::ContentGraphDTO;
 
 /// Build a related-anime graph without recursively re-fetching the root.
 ///
-/// The important detail here is that `buffered` preserves the input order,
-/// unlike `buffer_unordered`. MAL returns `related_anime` in a meaningful
-/// order, so preserving that order keeps the graph layout stable between
-/// requests while still allowing a small amount of concurrency.
+/// `buffered` preserves the input order, unlike `buffer_unordered`. MAL
+/// returns `related_anime` in a meaningful order, so preserving that order
+/// keeps the graph layout stable between requests while retaining a small
+/// amount of concurrency.
 pub async fn get_related_anime(
     service: &AnimeService,
     id: i64,
 ) -> Result<ContentGraphDTO, Box<dyn Error>> {
+    // Always prefer the cache first. The old implementation deliberately
+    // bypassed it for the root and then fetched the root a second time from
+    // the queue, which made repeated graph tests unnecessarily expensive.
     let root = get_anime_by_id(service, id).await?;
 
     let mut graph = ContentGraphDTO {
@@ -42,17 +45,17 @@ pub async fn get_related_anime(
         .collect();
 
     while !queue.is_empty() {
-        // Keep the burst deliberately small. The cache makes repeated graph
-        // traversals cheap, while a small MAL burst reduces rate-limit risk.
+        // Keep the MAL request burst deliberately small. The cache makes
+        // repeated graph traversals cheap, while a small burst reduces the
+        // chance of rate limiting when several graphs are opened in a row.
         let mut batch = Vec::with_capacity(2);
         while batch.len() < 2 {
             let Some(current_id) = queue.pop_front() else { break };
             batch.push(current_id);
         }
 
-        // `buffered`, rather than `buffer_unordered`, is intentional: it
-        // preserves the order of the batch and therefore the order of edges
-        // entering GraphView/Sugiyama.
+        // Do not use buffer_unordered here: completion order is nondeterministic
+        // and was the direct cause of the graph's unstable serial/layout.
         let results = stream::iter(batch)
             .map(|current_id| async move {
                 match get_anime_by_id(service, current_id).await {
@@ -75,8 +78,8 @@ pub async fn get_related_anime(
             graph.nodes.insert(anime.clone().into());
 
             // Match the original graph semantics: only add an edge when its
-            // target is a new node. This prevents cycles/cross-links from
-            // making the franchise look unordered or overly tangled.
+            // target is a new node. This avoids cycles/cross-links that make
+            // long franchises visually tangled.
             for edge in get_edges(current_id, anime.related_anime.clone(), false) {
                 if visited.insert(edge.target) {
                     graph.edges.push(edge.clone().into());
@@ -137,10 +140,4 @@ fn valid_relation(relation_type: &RelationType, include_others: bool) -> bool {
         RelationType::Character => false,
         RelationType::Other => include_others,
     }
-}
-
-// Keep the conversion visible to the compiler when this module is used with
-// a DTO-only graph response.
-fn _node(_anime: Anime) -> ContentNodeDTO {
-    _anime.into()
 }
