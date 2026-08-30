@@ -29,10 +29,13 @@ impl LLMClient {
             "temperature": 0.6,
             "top_p": 0.7,
             "max_tokens": 4096,
-            "stream": false
+            "stream": false,
+            "tool_choice": "none",
+            "response_format": {"type": "json_object"}
         });
 
-        // Retry transient provider failures such as 429 and 5xx responses.
+        // Retry transient provider failures such as 429/5xx and successful
+        // responses that contain no usable assistant text.
         const MAX_ATTEMPTS: usize = 4;
 
         let text = {
@@ -53,24 +56,40 @@ impl LLMClient {
                         let text = res.text().await?;
 
                         if status.is_success() {
-                            final_text = Some(text);
-                            break;
-                        }
+                            let has_content = serde_json::from_str::<OpenAIResponse>(&text)
+                                .ok()
+                                .and_then(|response| response.choices.first().cloned())
+                                .map(|choice| !choice.message.content.trim().is_empty())
+                                .unwrap_or(false);
 
-                        let retryable = status.as_u16() == 429 || status.is_server_error();
-                        if !retryable || attempt == MAX_ATTEMPTS {
-                            println!("LLM API failed with status {}: {}", status, text);
-                            return Err(
-                                format!("LLM API failed with status {}: {}", status, text).into()
+                            if has_content || attempt == MAX_ATTEMPTS {
+                                final_text = Some(text);
+                                break;
+                            }
+
+                            println!(
+                                "LLM API returned an empty assistant response (attempt {}/{}). Retrying...",
+                                attempt, MAX_ATTEMPTS
+                            );
+                        } else {
+                            let retryable = status.as_u16() == 429 || status.is_server_error();
+                            if !retryable || attempt == MAX_ATTEMPTS {
+                                println!("LLM API failed with status {}: {}", status, text);
+                                return Err(
+                                    format!("LLM API failed with status {}: {}", status, text).into()
+                                );
+                            }
+
+                            println!(
+                                "LLM API returned {} (attempt {}/{}). Retrying...",
+                                status, attempt, MAX_ATTEMPTS
                             );
                         }
 
-                        let delay_secs = 2_u64.pow((attempt - 1) as u32);
-                        println!(
-                            "LLM API returned {} (attempt {}/{}). Retrying in {}s...",
-                            status, attempt, MAX_ATTEMPTS, delay_secs
-                        );
-                        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                        if attempt < MAX_ATTEMPTS {
+                            let delay_secs = 2_u64.pow((attempt - 1) as u32);
+                            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                        }
                     }
                     Err(e) => {
                         if attempt == MAX_ATTEMPTS {
@@ -101,7 +120,11 @@ impl LLMClient {
             .map_err(|e| format!("Failed to parse JSON: {} | Response Text: '{}'", e, text))?;
 
         if let Some(choice) = response.choices.first() {
-            Ok(choice.message.content.clone())
+            let content = choice.message.content.trim();
+            if content.is_empty() {
+                return Err("LLM API returned an empty assistant response".into());
+            }
+            Ok(content.to_string())
         } else {
             Err(format!("LLM API returned no choices! Response: {}", text).into())
         }
