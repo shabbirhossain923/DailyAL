@@ -19,8 +19,27 @@ use serde_json::{json, Value};
 pub async fn get_related_anime(
     Path(mal_id): Path<i64>,
     State(data): State<Arc<AppState>>,
-) -> Json<ContentGraphDTO> {
-    Json(data.anime_service.get_related_anime(mal_id).await.unwrap())
+) -> Result<Json<ContentGraphDTO>, (StatusCode, String)> {
+    println!("Graph request started for anime {}", mal_id);
+
+    match data.anime_service.get_related_anime(mal_id).await {
+        Ok(graph) => {
+            println!(
+                "Graph request completed for anime {}: {} nodes, {} edges",
+                mal_id,
+                graph.nodes.len(),
+                graph.edges.len()
+            );
+            Ok(Json(graph))
+        }
+        Err(error) => {
+            println!("Graph request FAILED for anime {}: {}", mal_id, error);
+            Err((
+                StatusCode::BAD_GATEWAY,
+                format!("Graph generation failed for anime {}: {}", mal_id, error),
+            ))
+        }
+    }
 }
 
 /// A function to handle GET requests at /anime
