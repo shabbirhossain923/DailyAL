@@ -3,6 +3,7 @@ use dotenv::dotenv;
 use reqwest;
 use scheduler_service::run_schedulers;
 
+mod anime_graph_service;
 mod anime_link_service;
 mod anime_service;
 mod auth;
