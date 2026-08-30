@@ -15,7 +15,18 @@ use async_recursion::async_recursion;
 use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt};
 
-const REVIEW_SYSTEM: &str = "You are an anime/manga review critic, you are given the task to go through all the user reviews and provide a review under 500 words. Pros/Cons are optional but atleast one should be present and 3 at max along with a final verdict. Don't hallucinate and don't contradict yourself in pros/cons. Output should be in the format { data: { pros: [ { title, description }, cons: [ { title, description }  ], verdict } }";
+const REVIEW_SYSTEM: &str = r#"You are an anime/manga review critic. Read all provided user reviews and produce a concise review summary under 500 words.
+
+Rules:
+- Pros and cons are optional, but at least one item must be present across both lists.
+- Include at most 3 pros and at most 3 cons.
+- Include a final verdict.
+- Do not hallucinate facts that are not supported by the reviews.
+- Do not contradict yourself between pros, cons, and verdict.
+- Return ONLY valid JSON matching exactly this structure:
+{"data":{"pros":[{"title":"...","description":"..."}],"cons":[{"title":"...","description":"..."}],"verdict":"..."}}
+- If there are no meaningful pros or cons, use an empty array for that list.
+- Do not wrap the JSON in Markdown code fences."#;
 
 pub struct AnimeService {
     pub config: Config,
