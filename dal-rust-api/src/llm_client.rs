@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use crate::{config::Config, model::OpenAIResponse};
+use crate::config::Config;
 
 #[derive(Debug, Clone)]
 pub struct LLMClient {
@@ -20,7 +20,6 @@ impl LLMClient {
 
         // Optional fallback. This is deliberately read at runtime so existing
         // Render deployments do not need a new environment variable.
-        // Gemini 3.1 Flash-Lite is a stable, high-throughput fallback model.
         let fallback_model = std::env::var("LLM_FALLBACK_MODEL_NAME")
             .unwrap_or_else(|_| "gemini-3.1-flash-lite".to_string());
 
