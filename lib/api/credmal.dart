@@ -37,8 +37,6 @@ class CredMal {
   }
 
   /// Redirect Uri - platform-specific for OAuth callback
-  /// Android/iOS: custom URL scheme
-  /// Linux/Windows/macOS: localhost for flutter_web_auth_2
   static String get redirectUri {
     if (!kIsWeb &&
         (Platform.isLinux || Platform.isWindows || Platform.isMacOS)) {
@@ -121,8 +119,16 @@ class CredMal {
     return '${environment['SUPABASE_KEY']}';
   }
 
+  /// DAL API base URL used by graph/review/image endpoints.
+  /// Older builds could turn a missing API_URL into the literal string
+  /// "null", which made graph requests go to an invalid host. Keep the
+  /// deployed API as a safe fallback while still allowing API_URL to override it.
   static String get apiURL {
-    return '${environment['API_URL']}';
+    final configured = environment['API_URL']?.trim();
+    if (configured == null || configured.isEmpty || configured == 'null') {
+      return 'https://dailyal-s3ym.onrender.com';
+    }
+    return configured.replaceFirst(RegExp(r'/+$'), '');
   }
 
   static String get apiSecret {
