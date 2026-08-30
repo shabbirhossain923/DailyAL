@@ -45,16 +45,15 @@ impl AnimeService {
         from_cache: bool,
         include_others: bool,
     ) -> Result<(), Box<dyn Error>> {
-        // The public method still uses this signature for compatibility, but the
-        // actual traversal is iterative. This prevents deep relation chains from
-        // growing the async call stack and avoids fetching the same MAL ID more
-        // than once when multiple relations point at it.
+        // Keep the public method signature for compatibility, but use an
+        // iterative breadth-first traversal so deep/large franchises do not
+        // grow the async call stack and duplicate targets are fetched once.
         let root = match self.get_anime_by_id(id, from_cache).await {
             Ok(anime) => anime,
             Err(_) => return Ok(()),
         };
 
-        graph.nodes.insert(root.clone().into());
+        graph.nodes.insert(root.into());
 
         let mut visited: HashSet<i64> = HashSet::new();
         visited.insert(id);
@@ -62,22 +61,15 @@ impl AnimeService {
         queue.push_back((id, include_others));
 
         while !queue.is_empty() {
-            // Take a bounded batch so a large franchise does not create an
-            // unbounded number of simultaneous MAL requests.
             let mut batch = Vec::with_capacity(5);
             while batch.len() < 5 {
-                let Some((current_id, current_include_others)) = queue.pop_front() else {
-                    break;
-                };
-                batch.push((current_id, current_include_others));
+                let Some(item) = queue.pop_front() else { break };
+                batch.push(item);
             }
 
             let results = stream::iter(batch)
                 .map(|(current_id, current_include_others)| async move {
-                    let anime = match self.get_anime_by_id(current_id, true).await {
-                        Ok(anime) => anime,
-                        Err(_) => return None,
-                    };
+                    let anime = self.get_anime_by_id(current_id, true).await.ok()?;
                     let edges = self.get_unvisited_edges(
                         current_id,
                         anime.related_anime.clone(),
@@ -91,18 +83,19 @@ impl AnimeService {
 
             for result in results.into_iter().flatten() {
                 let (anime, edges) = result;
-                graph.nodes.insert(anime.clone().into());
+                graph.nodes.insert(anime.into());
 
                 for edge in edges {
-                    // Record each edge once and only schedule a target once.
+                    // The API DTO does not implement PartialEq for relation
+                    // types, so deduplicate by the relation endpoints.
                     if !graph.edges.iter().any(|existing| {
-                        existing.source == edge.source
-                            && existing.target == edge.target
-                            && existing.relation_type == edge.relation_type
+                        existing.source == edge.source && existing.target == edge.target
                     }) {
                         graph.edges.push(edge.clone().into());
                     }
 
+                    // Mark a target visited before fetching it. This prevents
+                    // duplicate requests when several nodes point to it.
                     if visited.insert(edge.target) {
                         queue.push_back((edge.target, false));
                     }
