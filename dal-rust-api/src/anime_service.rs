@@ -1,8 +1,7 @@
 use seahash::SeaHasher;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::hash::Hasher;
-use std::sync::{Arc, Mutex};
 
 use crate::model::{
     Anime, AnimeLink, AnimeQuery, Edge, RelatedAnime, RelationType, ReviewResponse,
@@ -10,8 +9,7 @@ use crate::model::{
 };
 
 use crate::config::Config;
-use crate::model_dto::{ContentGraphDTO, ContentNodeDTO};
-use async_recursion::async_recursion;
+use crate::model_dto::ContentGraphDTO;
 use chrono::{DateTime, Utc};
 use futures::{stream, StreamExt};
 
@@ -43,15 +41,12 @@ impl AnimeService {
             edges: Vec::new(),
         };
 
-        // A root failure is a real graph error. Do not hide it as an empty
-        // graph, otherwise the client only sees a misleading "No Content".
         self.get_related_anime_with_graph(id, &mut graph, false, true)
             .await?;
 
         Ok(graph)
     }
 
-    #[async_recursion]
     pub async fn get_related_anime_with_graph(
         &self,
         id: i64,
@@ -59,81 +54,72 @@ impl AnimeService {
         from_cache: bool,
         include_others: bool,
     ) -> Result<(), Box<dyn Error>> {
-        // Keep the public method signature for compatibility, but use an
-        // iterative breadth-first traversal so deep/large franchises do not
-        // grow the async call stack and duplicate targets are fetched once.
+        // Build the graph as a franchise graph, not as a watch-order graph.
+        // MAL relations can contain weak/crossover links, so every traversed
+        // relation must still belong to the same franchise as the root.
         let root = self.get_anime_by_id(id, from_cache).await?;
-
-        graph.nodes.insert(root.into());
+        let franchise_tokens = Self::franchise_tokens(&root);
 
         let mut visited: HashSet<i64> = HashSet::new();
         visited.insert(id);
-        let mut queue: VecDeque<(i64, bool)> = VecDeque::new();
-        queue.push_back((id, include_others));
 
-        while !queue.is_empty() {
-            // Keep the MAL request burst deliberately small. A large
-            // franchise can otherwise trigger MAL's rate limiter before the
-            // retry logic in MalAPI gets a chance to recover.
-            let mut batch = Vec::with_capacity(2);
-            while batch.len() < 2 {
-                let Some(item) = queue.pop_front() else { break };
-                batch.push(item);
+        // Each frontier already contains fetched Anime values. This avoids
+        // fetching the root twice and lets the next frontier be fetched in
+        // parallel with a small, rate-limit-friendly concurrency cap.
+        let mut frontier = vec![(root, include_others)];
+
+        while !frontier.is_empty() {
+            let mut next_ids = Vec::new();
+
+            for (anime, allow_other) in frontier.drain(..) {
+                let current_id = anime.id;
+                graph.nodes.insert(anime.clone().into());
+
+                let edges = self.get_unvisited_edges(
+                    current_id,
+                    anime.related_anime.clone(),
+                    allow_other,
+                    &franchise_tokens,
+                );
+
+                for edge in edges {
+                    // Preserve different relation types between the same pair.
+                    if !graph.edges.iter().any(|existing| {
+                        existing.source == edge.source
+                            && existing.target == edge.target
+                            && format!("{:?}", existing.relation_type)
+                                == format!("{:?}", edge.relation_type)
+                    }) {
+                        graph.edges.push(edge.clone().into());
+                    }
+
+                    if visited.insert(edge.target) {
+                        next_ids.push(edge.target);
+                    }
+                }
             }
 
-            let results = stream::iter(batch)
-                .map(|(current_id, current_include_others)| async move {
-                    match self.get_anime_by_id(current_id, true).await {
-                        Ok(anime) => {
-                            let edges = self.get_unvisited_edges(
-                                current_id,
-                                anime.related_anime.clone(),
-                                current_include_others,
-                            );
-                            Some((anime, edges))
-                        }
+            let fetched = stream::iter(next_ids)
+                .map(|target| async move {
+                    match self.get_anime_by_id(target, true).await {
+                        Ok(anime) => Some((anime, false)),
                         Err(error) => {
                             println!(
                                 "Graph node fetch failed for anime {}: {}",
-                                current_id, error
+                                target, error
                             );
                             None
                         }
                     }
                 })
-                .buffer_unordered(2)
+                .buffer_unordered(5)
                 .collect::<Vec<_>>()
                 .await;
 
-            for result in results.into_iter().flatten() {
-                let (anime, edges) = result;
-                graph.nodes.insert(anime.into());
-
-                for edge in edges {
-                    // The API DTO does not implement PartialEq for relation
-                    // types, so deduplicate by the relation endpoints.
-                    if !graph.edges.iter().any(|existing| {
-                        existing.source == edge.source && existing.target == edge.target
-                    }) {
-                        graph.edges.push(edge.clone().into());
-                    }
-
-                    // Mark a target visited before fetching it. This prevents
-                    // duplicate requests when several nodes point to it.
-                    if visited.insert(edge.target) {
-                        queue.push_back((edge.target, false));
-                    }
-                }
-            }
+            frontier = fetched.into_iter().flatten().collect();
         }
 
         Ok(())
-    }
-
-    async fn get_edges_from_id(&self, id: i64) -> Option<(Anime, Vec<Edge>)> {
-        let anime = self.get_anime_by_id(id, true).await.ok()?;
-        let vec = anime.related_anime.clone();
-        Some((anime, self.get_unvisited_edges(id, vec, false)))
     }
 
     fn get_unvisited_edges(
@@ -141,35 +127,20 @@ impl AnimeService {
         id: i64,
         related_anime: Option<Vec<RelatedAnime>>,
         include_others: bool,
+        franchise_tokens: &HashSet<String>,
     ) -> Vec<Edge> {
-        let mut unvisited_edges: Vec<Edge> = Vec::new();
-        if let Some(related_anime) = related_anime {
-            unvisited_edges.extend(
-                related_anime
-                    .iter()
-                    .filter(|related_anime| {
-                        self.valid_relation(&related_anime.relation_type, include_others)
-                    })
-                    .map(|related_anime| Edge {
-                        source: id,
-                        target: related_anime.node.id,
-                        relation_type: related_anime.relation_type.clone(),
-                    }),
-            );
-        }
-        unvisited_edges
-    }
-
-    fn filter_by_nodes(&self, edges: Vec<Edge>, nodes: &HashSet<ContentNodeDTO>) -> Vec<Edge> {
-        edges
-            .iter()
-            .filter(|edge| {
-                !nodes.contains(&ContentNodeDTO {
-                    id: edge.target,
-                    ..Default::default()
-                })
+        related_anime
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|related| {
+                self.valid_relation(&related.relation_type, include_others)
+                    && Self::same_franchise(&related.node.title, franchise_tokens)
             })
-            .cloned()
+            .map(|related| Edge {
+                source: id,
+                target: related.node.id,
+                relation_type: related.relation_type,
+            })
             .collect()
     }
 
@@ -189,36 +160,85 @@ impl AnimeService {
         }
     }
 
+    fn franchise_tokens(anime: &Anime) -> HashSet<String> {
+        let mut titles = vec![anime.title.clone()];
+        if let Some(alternative) = &anime.alternative_titles {
+            if let Some(en) = &alternative.en {
+                titles.push(en.clone());
+            }
+            if let Some(ja) = &alternative.ja {
+                titles.push(ja.clone());
+            }
+        }
+
+        let generic = [
+            "season", "part", "movie", "special", "ova", "ona", "oad", "tv", "the",
+            "final", "chapter", "episode", "edition", "version", "story", "series",
+        ];
+
+        titles
+            .iter()
+            .flat_map(|title| {
+                title
+                    .to_lowercase()
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|token| token.len() >= 4 && !generic.contains(token))
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn same_franchise(title: &str, franchise_tokens: &HashSet<String>) -> bool {
+        if franchise_tokens.is_empty() {
+            return true;
+        }
+
+        title
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|token| token.len() >= 4 && franchise_tokens.contains(token))
+    }
+
     async fn get_anime_by_id(&self, id: i64, from_cache: bool) -> Result<Anime, Box<dyn Error>> {
         let now = chrono::Utc::now();
         let result = match from_cache {
-            true => {
-                self.cache_service
-                    .get_cache_by_id("anime", id.to_string())
-                    .await
-            }
+            true => self
+                .cache_service
+                .get_cache_by_id("anime", id.to_string())
+                .await,
             false => None,
         };
 
-        if result.is_none() {
-            println!(
-                "{}: Cache miss anime: {}",
-                now.format("%d/%m/%Y %H:%M:%S"),
-                id
-            );
-            let anime = self.mal_api.get_anime_details(id).await?;
-            self.cache_service
-                .set_cache_by_id("anime", id.to_string(), &anime, None)
-                .await;
-            let then = chrono::Utc::now();
-            self.log_anime(&anime, "Saved".to_string(), then, now);
-            Ok(anime)
-        } else {
-            let anime = result.unwrap();
+        if let Some(anime) = result {
             let then = chrono::Utc::now();
             self.log_anime(&anime, "Cache hit".to_string(), then, now);
-            Ok(anime)
+            return Ok(anime);
         }
+
+        println!(
+            "{}: Cache miss anime: {}",
+            now.format("%d/%m/%Y %H:%M:%S"),
+            id
+        );
+
+        let anime = self.mal_api.get_anime_details(id).await?;
+
+        // Do not make the graph request wait for the persistent cache write.
+        // set_cache_by_id updates the in-memory cache before the DynamoDB write,
+        // so later graph nodes in this same request can still hit the cache.
+        let cache_service = self.cache_service.clone();
+        let cache_anime = anime.clone();
+        let cache_id = id.to_string();
+        tokio::spawn(async move {
+            let _ = cache_service
+                .set_cache_by_id("anime", cache_id, &cache_anime, None)
+                .await;
+        });
+
+        let then = chrono::Utc::now();
+        self.log_anime(&anime, "Fetched".to_string(), then, now);
+        Ok(anime)
     }
 
     fn log_anime(
@@ -252,7 +272,6 @@ impl AnimeService {
         println!("Summarizing review {}", reviews.len());
 
         let hash_str = self.hash_str(reviews);
-
         println!("Using hash_key: {}", hash_str);
 
         let cached_review: Option<ReviewResponse> = self
