@@ -1,4 +1,6 @@
 import 'dart:collection';
+import 'dart:io';
+import 'dart:ui' as ui;
 
 import 'package:auto_size_text/auto_size_text.dart';
 import 'package:dailyanimelist/api/malapi.dart';
@@ -7,16 +9,13 @@ import 'package:dailyanimelist/enums.dart';
 import 'package:dailyanimelist/generated/l10n.dart';
 import 'package:dailyanimelist/screens/contentdetailedscreen.dart';
 import 'package:dailyanimelist/screens/plainscreen.dart';
-
 import 'package:dailyanimelist/widgets/home/animecard.dart';
 import 'package:dailyanimelist/widgets/selectbottom.dart';
 import 'package:dal_commons/commons.dart' as dal;
 import 'package:flutter/material.dart';
-import 'package:graphview/GraphView.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter/rendering.dart';
-import 'dart:ui' as ui;
-import 'dart:io';
+import 'package:flutter/services.dart';
+import 'package:graphview/GraphView.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
@@ -30,6 +29,7 @@ class AnimeGraphWidget extends StatefulWidget {
   final int id;
   final Map<int, dal.MyListStatus> statusMap;
   final List<Widget> actions;
+
   const AnimeGraphWidget({
     super.key,
     required this.graph,
@@ -43,51 +43,83 @@ class AnimeGraphWidget extends StatefulWidget {
 }
 
 class _AnimeGraphWidgetState extends State<AnimeGraphWidget> {
-  Graph _graph = Graph()..isTree = false;
-  late SugiyamaAlgorithm _algorithm;
   final Map<int, dal.GraphNode> _nodeMap = HashMap();
-  final List<int> _expandedIds = [];
-  final TransformationController _controller = TransformationController();
-  final _edgeColorMap = {
-    dal.GRelationType.sequel: Colors.green,
-    dal.GRelationType.prequel: Colors.red,
-  };
-  final _edgeStrokeWidthMap = {
-    dal.GRelationType.sequel: 3.0,
-    dal.GRelationType.prequel: 3.0,
-  };
-  final _graphTypeMap = {
-    _GraphOrderType.by_sequel: S.current.Graph_Order_By_Sequel,
-    _GraphOrderType.from_selected: S.current.Graph_Order_From_Selected,
-  };
-  _GraphOrderType _graphOrderType = _GraphOrderType.from_selected;
+  final Set<int> _expandedIds = <int>{};
+  final Set<String> _edgeKeys = <String>{};
+  final GlobalKey _graphKey = GlobalKey();
+  final GraphViewController _graphController = GraphViewController();
+
+  late Graph _graph;
+  late SugiyamaAlgorithm _algorithm;
   late int _selectedId;
-  final GlobalKey _globalKey = GlobalKey();
+
+  _GraphOrderType _graphOrderType = _GraphOrderType.from_selected;
+
+  static const _sequelColor = Colors.green;
+  static const _prequelColor = Colors.red;
+  static const _otherColor = Colors.blue;
 
   @override
   void initState() {
     super.initState();
     _selectedId = widget.id;
-    widget.graph.nodes?.forEach((node) => _nodeMap[node.id!] = node);
-    _setGraph();
-
-    _algorithm = SugiyamaAlgorithm(SugiyamaConfiguration()
-      ..bendPointShape = CurvedBendPointShape(curveLength: 120.0)
-      ..nodeSeparation = 60
-      ..levelSeparation = 100);
-
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _setInitialPosition();
-    });
+    for (final node in widget.graph.nodes ?? const <dal.GraphNode>[]) {
+      if (node.id != null) {
+        _nodeMap[node.id!] = node;
+      }
+    }
+    _buildGraph();
+    _buildAlgorithm();
   }
 
-  void _setGraph() {
+  void _buildAlgorithm() {
+    final configuration = SugiyamaConfiguration()
+      ..orientation = SugiyamaConfiguration.ORIENTATION_TOP_BOTTOM
+      ..nodeSeparation = 85
+      ..levelSeparation = 125
+      ..iterations = 18
+      ..layeringStrategy = LayeringStrategy.longestPath
+      ..crossMinimizationStrategy = CrossMinimizationStrategy.accumulatorTree
+      ..coordinateAssignment = CoordinateAssignment.Average
+      ..postStraighten = true
+      ..addTriangleToEdge = true
+      ..bendPointShape = CurvedBendPointShape(curveLength: 90);
+
+    _algorithm = SugiyamaAlgorithm(configuration);
+  }
+
+  void _buildGraph() {
     _graph = Graph()..isTree = false;
-    final edges = widget.graph.edges?.map(_mapEdges).toList() ?? [];
-    edges.forEach(_addEdge);
+    _edgeKeys.clear();
+
+    // Add every node first so isolated related titles are still visible.
+    for (final id in _nodeMap.keys) {
+      _graph.addNode(Node.Id(id));
+    }
+
+    for (final edge in widget.graph.edges ?? const <dal.GraphEdge>[]) {
+      final mapped = _mapEdge(edge);
+      final source = mapped.source;
+      final target = mapped.target;
+      if (source == null || target == null) continue;
+      if (!_nodeMap.containsKey(source) || !_nodeMap.containsKey(target)) continue;
+
+      final key = '$source->$target:${mapped.relationType}';
+      if (!_edgeKeys.add(key)) continue;
+
+      _graph.addEdge(
+        Node.Id(source),
+        Node.Id(target),
+        paint: Paint()
+          ..color = _getColorByRelationType(mapped.relationType)
+          ..strokeWidth = _getStrokeWidth(mapped.relationType)
+          ..style = PaintingStyle.stroke
+          ..strokeCap = StrokeCap.round,
+      );
+    }
   }
 
-  dal.GraphEdge _mapEdges(edge) {
+  dal.GraphEdge _mapEdge(dal.GraphEdge edge) {
     if (_graphOrderType == _GraphOrderType.by_sequel) {
       if (edge.relationType == dal.GRelationType.prequel) {
         return dal.GraphEdge(
@@ -95,90 +127,89 @@ class _AnimeGraphWidgetState extends State<AnimeGraphWidget> {
           target: edge.source,
           relationType: dal.GRelationType.sequel,
         );
-      } else if (edge.relationType != dal.GRelationType.sequel) {
-        final getEdge = _getEdge(edge);
-        if (getEdge != null) return getEdge;
+      }
+
+      if (edge.relationType != dal.GRelationType.sequel) {
+        final chronological = _chronologicalEdge(edge);
+        if (chronological != null) return chronological;
       }
     }
     return edge;
   }
 
-  dal.GraphEdge? _getEdge(dal.GraphEdge edge) {
-    int? source, target;
-    final seasonOne = _nodeMap[edge.source!]?.startSeason;
-    final seasonTwo = _nodeMap[edge.target!]?.startSeason;
-    if (seasonOne?.year == null && seasonTwo?.year != null) {
-      source = edge.target;
-      target = edge.source;
-    } else if (seasonOne?.year != null && seasonTwo?.year == null) {
-      source = edge.source;
-      target = edge.target;
-    } else if (seasonOne?.year == null ||
-        seasonTwo?.year == null ||
-        seasonOne?.season == null ||
-        seasonTwo?.season == null) {
-      source = edge.source;
-      target = edge.target;
-    } else {
-      try {
-        var oneTime = _getTimeUsingGSeason(seasonOne);
-        var twoTime = _getTimeUsingGSeason(seasonTwo);
-        if (oneTime.isBefore(twoTime)) {
-          source = edge.source;
-          target = edge.target;
-        } else {
-          source = edge.target;
-          target = edge.source;
-        }
-      } catch (e) {}
-    }
-    if (source != null && target != null) {
-      return dal.GraphEdge(
-        source: source,
-        target: target,
-        relationType: edge.relationType,
+  dal.GraphEdge? _chronologicalEdge(dal.GraphEdge edge) {
+    final source = edge.source;
+    final target = edge.target;
+    if (source == null || target == null) return null;
+
+    final first = _nodeMap[source]?.startSeason;
+    final second = _nodeMap[target]?.startSeason;
+    if (first?.year == null || second?.year == null) return edge;
+    if (first?.season == null || second?.season == null) return edge;
+
+    try {
+      final firstDate = MalApi.getDateTimeForSeason(
+        seasonMapInverse[dal.seasonValues.reverse[first!.season]]!,
+        first.year!,
       );
-    }
-    return null;
-  }
-
-  DateTime _getTimeUsingGSeason(dal.GStartSeason? seasonOne) {
-    return MalApi.getDateTimeForSeason(
-        seasonMapInverse[dal.seasonValues.reverse[seasonOne!.season]]!,
-        seasonOne.year!);
-  }
-
-  void _addEdge(dal.GraphEdge edge) {
-    final fromNodeId = Node.Id(edge.source);
-    final toNodeId = Node.Id(edge.target);
-    _graph.addEdge(fromNodeId, toNodeId)
-      ..paint = (Paint()
-        ..color = _getColorByRelationType(edge.relationType)
-        ..strokeWidth = _edgeStrokeWidthMap[edge.relationType] ?? 1.0
-        ..style = PaintingStyle.stroke);
-  }
-
-  void _setInitialPosition([Size? size]) {
-    final position = _algorithm.nodeData.keys.firstWhere((e) {
-      return e.key?.value == _selectedId;
-    }).position;
-    final contextSize = size ?? MediaQuery.of(context).size;
-    _controller.value = Matrix4.identity()
-      ..scale(0.6, 0.6)
-      ..translate(
-        -(position.dx - (contextSize.width / 2) - 50.0),
-        -(position.dy - (contextSize.height / 2)),
+      final secondDate = MalApi.getDateTimeForSeason(
+        seasonMapInverse[dal.seasonValues.reverse[second!.season]]!,
+        second.year!,
       );
+      return firstDate.isBefore(secondDate)
+          ? edge
+          : dal.GraphEdge(
+              source: target,
+              target: source,
+              relationType: edge.relationType,
+            );
+    } catch (_) {
+      return edge;
+    }
   }
 
   Color _getColorByRelationType(dal.GRelationType? relationType) {
-    return _edgeColorMap[relationType] ?? Colors.blue;
+    switch (relationType) {
+      case dal.GRelationType.sequel:
+        return _sequelColor;
+      case dal.GRelationType.prequel:
+        return _prequelColor;
+      default:
+        return _otherColor;
+    }
+  }
+
+  double _getStrokeWidth(dal.GRelationType? relationType) {
+    switch (relationType) {
+      case dal.GRelationType.sequel:
+      case dal.GRelationType.prequel:
+        return 3.2;
+      default:
+        return 2.2;
+    }
+  }
+
+  void _rebuildLayout() {
+    _buildGraph();
+    _buildAlgorithm();
+    _graphController.forceRecalculation();
+    if (mounted) setState(() {});
+  }
+
+  void _focusSelected({bool animated = true}) {
+    _selectedId = _selectedId == 0 ? widget.id : _selectedId;
+    final key = ValueKey(_selectedId);
+    if (animated) {
+      _graphController.animateToNode(key);
+    } else {
+      _graphController.jumpToNode(key);
+    }
   }
 
   @override
   void dispose() {
+    _graphController.resetView();
     super.dispose();
-    _controller.dispose();
   }
 
   @override
@@ -186,23 +217,24 @@ class _AnimeGraphWidgetState extends State<AnimeGraphWidget> {
     return TitlebarScreen(
       Stack(
         children: [
-          InteractiveViewer(
-            constrained: false,
-            boundaryMargin: EdgeInsets.all(double.infinity),
-            minScale: 0.01,
-            maxScale: 5.6,
-            transformationController: _controller,
-            child: RepaintBoundary(
-              key: _globalKey,
-              child: GraphView(
-                graph: _graph,
-                algorithm: _algorithm,
-                animated: false,
-                builder: (Node node) {
-                  var a = node.key?.value as int?;
-                  return rectangleWidget(_nodeMap[a]!);
-                },
-              ),
+          RepaintBoundary(
+            key: _graphKey,
+            child: GraphView.builder(
+              graph: _graph,
+              algorithm: _algorithm,
+              controller: _graphController,
+              animated: true,
+              initialNode: ValueKey(widget.id),
+              centerGraph: true,
+              panAnimationDuration: const Duration(milliseconds: 450),
+              toggleAnimationDuration: const Duration(milliseconds: 300),
+              builder: (Node node) {
+                final id = node.key?.value as int?;
+                final data = id == null ? null : _nodeMap[id];
+                return data == null
+                    ? const SizedBox(width: 120, height: 120)
+                    : _nodeWidget(data);
+              },
             ),
           ),
           _bottomBar(),
@@ -213,17 +245,17 @@ class _AnimeGraphWidgetState extends State<AnimeGraphWidget> {
       actions: [
         SelectButton(
           popupText: S.current.Order_by,
-          selectedOption: _graphTypeMap[_graphOrderType],
-          child: Icon(Icons.swap_horiz),
-          options: _graphTypeMap.values.toList(),
-          onChanged: (p0) {
-            _graphOrderType = _graphTypeMap.entries
-                .firstWhere((element) => element.value == p0)
-                .key;
-            _setGraph();
-            if (mounted) setState(() {});
-            Future.delayed(Duration(milliseconds: 100), () {
-              _setInitialPosition();
+          selectedOption: _graphTypeLabel,
+          child: const Icon(Icons.swap_vert),
+          options: _graphTypeOptions,
+          onChanged: (value) {
+            final index = _graphTypeOptions.indexOf(value);
+            _graphOrderType = index == 0
+                ? _GraphOrderType.from_selected
+                : _GraphOrderType.by_sequel;
+            _rebuildLayout();
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              _focusSelected(animated: false);
             });
           },
         ),
@@ -232,409 +264,309 @@ class _AnimeGraphWidgetState extends State<AnimeGraphWidget> {
     );
   }
 
+  List<String> get _graphTypeOptions => [
+        S.current.Graph_Order_From_Selected,
+        S.current.Graph_Order_By_Sequel,
+      ];
+
+  String get _graphTypeLabel => _graphOrderType == _GraphOrderType.from_selected
+      ? S.current.Graph_Order_From_Selected
+      : S.current.Graph_Order_By_Sequel;
+
   Widget _bottomBar() {
     return Positioned(
-      bottom: 20,
-      left: 20,
-      right: 20,
-      child: Row(
-        children: [
-          IconButton.filled(
-            onPressed: () {
-              _selectedId = widget.id;
-              _setInitialPosition();
-              if (mounted) setState(() {});
-            },
-            icon: Icon(Icons.location_searching),
-          ),
-          Spacer(),
-          IconButton.filled(
-            onPressed: () => _onEdgeInfo(),
-            icon: Icon(Icons.info),
-          ),
-          SB.w20,
-          IconButton.filled(
-            onPressed: () => _captureAndSharePng(),
-            icon: Icon(Icons.camera_alt),
-          )
-        ],
-      ),
-    );
-  }
-
-  void _onEdgeInfo() {
-    showDialog(
-      context: context,
-      builder: (context) => Dialog(
-        child: Padding(
-          padding: const EdgeInsets.all(8.0),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 25.0),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        S.current.Graph_Edge_Info,
-                        style: Theme.of(context).textTheme.titleLarge,
-                      ),
-                    ),
-                    IconButton(
-                      onPressed: () => Navigator.pop(context),
-                      icon: Icon(Icons.close),
-                    ),
-                  ],
-                ),
-              ),
-              ..._getIndicator(S.current.Sequel, Colors.green),
-              ..._getIndicator(S.current.Prequel, Colors.red),
-              ..._getIndicator(S.current.Others, Colors.blue),
-              SB.h20,
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  List<Widget> _getIndicator(String text, Color color) {
-    return [
-      SB.h20,
-      Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 25.0),
-        child: Text(
-          text,
-          textAlign: TextAlign.start,
-        ),
-      ),
-      SB.h10,
-      Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 25, vertical: 5),
-        child: SizedBox(
-          child: Container(
-            height: 5.0,
-            width: double.infinity,
-            decoration: BoxDecoration(
-              color: color,
-              borderRadius: BorderRadius.circular(12.0),
+      left: 16,
+      right: 16,
+      bottom: 18,
+      child: SafeArea(
+        top: false,
+        child: Row(
+          children: [
+            IconButton.filled(
+              tooltip: 'Focus selected',
+              onPressed: () => _focusSelected(),
+              icon: const Icon(Icons.center_focus_strong),
             ),
-          ),
+            const Spacer(),
+            IconButton.filledTonal(
+              tooltip: 'Fit graph',
+              onPressed: () => _graphController.zoomToFit(),
+              icon: const Icon(Icons.fit_screen),
+            ),
+            const SizedBox(width: 8),
+            IconButton.filledTonal(
+              tooltip: 'Reset view',
+              onPressed: () => _graphController.resetView(),
+              icon: const Icon(Icons.refresh),
+            ),
+            const SizedBox(width: 8),
+            IconButton.filledTonal(
+              tooltip: 'Edge information',
+              onPressed: _showEdgeInfo,
+              icon: const Icon(Icons.info_outline),
+            ),
+            const SizedBox(width: 8),
+            IconButton.filledTonal(
+              tooltip: 'Share graph',
+              onPressed: _captureAndSharePng,
+              icon: const Icon(Icons.camera_alt_outlined),
+            ),
+          ],
         ),
-      )
-    ];
+      ),
+    );
   }
 
-  Widget rectangleWidget(dal.GraphNode a) {
+  Widget _nodeWidget(dal.GraphNode node) {
+    final expanded = _expandedIds.contains(node.id);
+    final selected = _selectedId == node.id;
+    final status = NodeStatusValue.fromListStatus(widget.statusMap[node.id]);
+
     return Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
-        _imageCover(a),
-        SB.h10,
-        _textWidget(a),
+        _cover(node, selected: selected, expanded: expanded, status: status),
+        const SizedBox(height: 8),
+        _titleCard(node, expanded: expanded),
       ],
     );
   }
 
-  Widget _textWidget(dal.GraphNode a) {
-    bool isExpanded = _expandedIds.contains(a.id);
-    final textWidget = SizedBox(
-      width: 130.0,
-      height: 50.0,
+  Widget _cover(
+    dal.GraphNode node, {
+    required bool selected,
+    required bool expanded,
+    required NodeStatusValue status,
+  }) {
+    final imageUrl = node.mainPicture?.large ?? node.mainPicture?.medium ?? '';
+    final borderColor = status.color ?? Theme.of(context).colorScheme.outline;
+
+    return GestureDetector(
+      onTap: () => _toggleExpanded(node),
+      onLongPress: () => _selectNode(node),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        width: selected ? 152 : 144,
+        height: selected ? 152 : 144,
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: Theme.of(context).cardColor,
+          border: Border.all(
+            color: selected ? Theme.of(context).colorScheme.primary : borderColor,
+            width: selected ? 4 : 2.5,
+          ),
+          boxShadow: [
+            if (selected || expanded)
+              BoxShadow(
+                color: (status.color ?? Theme.of(context).colorScheme.primary)
+                    .withOpacity(.24),
+                blurRadius: 14,
+                spreadRadius: 2,
+              ),
+          ],
+        ),
+        child: ClipOval(
+          child: imageUrl.isEmpty
+              ? const Icon(Icons.movie_outlined, size: 48)
+              : Image.network(
+                  imageUrl,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => const Icon(Icons.broken_image),
+                ),
+        ),
+      ),
+    );
+  }
+
+  Widget _titleCard(dal.GraphNode node, {required bool expanded}) {
+    final title = SizedBox(
+      width: 148,
+      height: expanded ? 58 : 48,
       child: Center(
         child: AutoSizeText(
-          a.title ?? "",
+          node.title ?? '',
           maxLines: 3,
-          minFontSize: 10.0,
+          minFontSize: 9,
           textAlign: TextAlign.center,
         ),
       ),
     );
-    final column = _getNodeDetails(isExpanded, a, textWidget);
-    return Card(
-      color: Theme.of(context).cardColor.withOpacity(isExpanded ? 1 : .7),
-      child: InkWell(
-        onTap: () => _setExpanded(a),
-        borderRadius: BorderRadius.circular(8),
-        child: Padding(
-          padding: const EdgeInsets.all(4.0),
-          child: !isExpanded ? textWidget : column,
-        ),
-      ),
-    );
-  }
 
-  Widget _getNodeDetails(
-      bool isExpanded, dal.GraphNode a, SizedBox textWidget) {
-    var starField2 = starField(
-      a.mean?.toString() ?? '?',
-      starHeight: 15,
-      textStyle: TextStyle(fontSize: 12),
-      useIcon: true,
-    );
-    return Padding(
-      padding: const EdgeInsets.all(4.0),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              textWidget,
-              IconButton.filledTonal(
-                onPressed: () => _onNodeTap(a),
-                icon: Icon(Icons.open_in_new),
-              ),
-            ],
-          ),
-          SB.h5,
-          Row(
-            children: [
-              starField2,
-              SB.w10,
-              Badge(
-                label: Text(
-                    '${a.startSeason?.season?.name.titleCase() ?? "?"} ${a.startSeason?.year ?? "?"}'),
-              ),
-            ],
-          ),
-          SB.h10,
-          Row(
-            children: [
-              SB.w10,
-              Badge(
-                label: Text(a.mediaType?.standardize() ?? "?"),
-              ),
-              SB.w10,
-              Badge(
-                label: Text(a.status?.standardize() ?? "?"),
-              ),
-              SB.w10,
-            ],
-          )
-        ],
-      ),
-    );
-  }
-
-  void _setExpanded(dal.GraphNode a) {
-    if (mounted) {
-      setState(() {
-        if (_expandedIds.contains(a.id)) {
-          _expandedIds.remove(a.id);
-        } else {
-          _expandedIds.add(a.id!);
-        }
-      });
+    if (!expanded) {
+      return Card(
+        margin: EdgeInsets.zero,
+        child: Padding(padding: const EdgeInsets.all(4), child: title),
+      );
     }
+
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(6),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Expanded(child: title),
+                IconButton.filledTonal(
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => _onNodeTap(node),
+                  icon: const Icon(Icons.open_in_new, size: 18),
+                ),
+              ],
+            ),
+            const SizedBox(height: 3),
+            Wrap(
+              alignment: WrapAlignment.center,
+              spacing: 5,
+              runSpacing: 4,
+              children: [
+                _badge(node.mean?.toString() ?? '?'),
+                _badge(
+                  '${node.startSeason?.season?.name.titleCase() ?? '?'} ${node.startSeason?.year ?? '?'}',
+                ),
+                _badge(node.mediaType?.standardize() ?? '?'),
+                _badge(node.status?.standardize() ?? '?'),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
-  Widget _imageCover(dal.GraphNode a) {
-    final imageUrl = a.mainPicture?.large ?? a.mainPicture?.medium ?? "";
-    var image = SizedBox(
-      width: 120,
-      height: 120,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(64),
-        onTap: () => _setExpanded(a),
-        onLongPress: () => _onNodeSelect(a),
-        child: Ink(
-          child: CircleAvatar(
-            backgroundImage: NetworkImage(imageUrl),
+  Widget _badge(String text) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Text(text, style: const TextStyle(fontSize: 10)),
+    );
+  }
+
+  void _toggleExpanded(dal.GraphNode node) {
+    if (node.id == null) return;
+    setState(() {
+      if (!_expandedIds.add(node.id!)) {
+        _expandedIds.remove(node.id!);
+      }
+      _selectedId = node.id!;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _graphController.forceRecalculation();
+      _graphController.animateToNode(ValueKey(node.id));
+    });
+  }
+
+  void _selectNode(dal.GraphNode node) {
+    if (node.id == null) return;
+    _selectedId = node.id!;
+    setState(() {});
+    _graphController.animateToNode(ValueKey(node.id));
+  }
+
+  void _onNodeTap(dal.GraphNode node) {
+    gotoPage(
+      context: context,
+      newPage: ContentDetailedScreen(
+        node: dal.Node(
+          id: node.id,
+          title: node.title,
+          mainPicture: dal.Picture(
+            large: node.mainPicture?.large,
+            medium: node.mainPicture?.medium,
           ),
         ),
       ),
     );
-    final myListStatus = widget.statusMap[a.id];
-    final value = NodeStatusValue.fromListStatus(myListStatus);
-    final contains = _expandedIds.contains(a.id);
-    final isSelected = _selectedId == a.id;
-    final statusOutline = Container(
-      height: 140.0,
-      width: 140.0,
-      decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: Theme.of(context).cardColor,
-          boxShadow: [
-            if (contains)
-              BoxShadow(
-                color: value.color?.withOpacity(0.1) ??
-                    Colors.white.withOpacity(0.1),
-                spreadRadius: 5,
-                blurRadius: 7,
-                offset: Offset(0, 3), // changes position of shadow
-              ),
+  }
+
+  void _showEdgeInfo() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Expanded(child: Text(S.current.Graph_Edge_Info)),
+            IconButton(
+              onPressed: () => Navigator.pop(context),
+              icon: const Icon(Icons.close),
+            ),
           ],
-          border: Border.all(
-            color: value.color ?? Colors.transparent,
-            width: 3.0,
-          )),
-    );
-    final centerBorder = Container(
-      height: 120.0,
-      width: 120.0,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        boxShadow: [
-          BoxShadow(
-            color: Colors.white.withOpacity(0.1),
-            spreadRadius: 5,
-            blurRadius: 7,
-            offset: Offset(0, 3), // changes position of shadow
-          ),
-        ],
-      ),
-    );
-    return SizedBox(
-      height: 140.0,
-      width: 140.0,
-      child: Stack(
-        children: [
-          if (isSelected) centerBorder,
-          if (value.color != null || contains) statusOutline,
-          Positioned(
-            top: 10,
-            left: 10,
-            child: image,
-          )
-        ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _legend(S.current.Sequel, _sequelColor),
+            _legend(S.current.Prequel, _prequelColor),
+            _legend(S.current.Others, _otherColor),
+            const SizedBox(height: 8),
+            const Text(
+              'Arrowheads point toward the destination anime.',
+              style: TextStyle(fontSize: 12),
+            ),
+          ],
+        ),
       ),
     );
   }
 
-  void _onNodeTap(dal.GraphNode a) {
-    gotoPage(
-        context: context,
-        newPage: ContentDetailedScreen(
-          node: dal.Node(
-              id: a.id,
-              title: a.title,
-              mainPicture: dal.Picture(
-                large: a.mainPicture?.large,
-                medium: a.mainPicture?.medium,
-              )),
-        ));
+  Widget _legend(String label, Color color) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Row(
+        children: [
+          Container(
+            width: 42,
+            height: 4,
+            decoration: BoxDecoration(
+              color: color,
+              borderRadius: BorderRadius.circular(4),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Text(label),
+        ],
+      ),
+    );
   }
 
   Future<void> _captureAndSharePng() async {
     try {
-      RenderRepaintBoundary boundary = _globalKey.currentContext!
-          .findRenderObject() as RenderRepaintBoundary;
+      final boundary = _graphKey.currentContext?.findRenderObject()
+          as RenderRepaintBoundary?;
+      if (boundary == null) return;
 
       ui.Image? graphImage;
-      // Try higher pixel ratios for better quality
-      final ratios = [50.0, 30.0, 15.0, 10.0, 5.0, 3.0, 1.0];
-
-      for (final ratio in ratios) {
+      for (final ratio in [4.0, 3.0, 2.0, 1.0]) {
         try {
           graphImage = await boundary.toImage(pixelRatio: ratio);
           break;
-        } catch (e) {
-          debugPrint('Failed to capture at ratio $ratio: $e');
-        }
+        } catch (_) {}
       }
-
       if (graphImage == null) {
         if (mounted) showToast(S.current.Couldnt_generate_graph);
         return;
       }
 
-      // Load Logo
-      final logoBytes = await rootBundle.load('assets/images/dal-black-bg.png');
-      final logoCodec = await ui.instantiateImageCodec(
-        logoBytes.buffer.asUint8List(),
-      );
-      final logoFrame = await logoCodec.getNextFrame();
-      final logoImage = logoFrame.image;
-
-      // Calculate sizes
-      // Footer height relative to graph height, but at least enough for logo + padding
-      final footerHeight = (graphImage.height * 0.15).clamp(100.0, 400.0);
-      final totalWidth = graphImage.width;
-      final totalHeight = graphImage.height + footerHeight.toInt();
-      final scaleFactor = totalWidth / 1000.0; // Base scale on width
-
-      // Create Canvas
-      final recorder = ui.PictureRecorder();
-      final canvas = Canvas(
-          recorder,
-          Rect.fromPoints(Offset.zero,
-              Offset(totalWidth.toDouble(), totalHeight.toDouble())));
-
-      // Draw Graph
-      canvas.drawImage(graphImage, Offset.zero, Paint());
-
-      // Draw Footer Background
-      final footerRect = Rect.fromLTWH(
-          0, graphImage.height.toDouble(), totalWidth.toDouble(), footerHeight);
-      canvas.drawRect(footerRect, Paint()..color = const Color(0xFF151515));
-
-      // Draw Logo
-      final logoSize = footerHeight * 0.7; // Logo takes 80% of footer height
-      final logoY = graphImage.height + (footerHeight - logoSize) / 2;
-      final logoX = 50.0 * scaleFactor; // Padding from left
-      final logoRect = Rect.fromLTWH(logoX, logoY, logoSize, logoSize);
-
-      // Paint logo with high quality filtering
-      paintImage(
-        canvas: canvas,
-        rect: logoRect,
-        image: logoImage,
-        fit: BoxFit.contain,
-        filterQuality: FilterQuality.high,
-      );
-
-      // Draw Text
-      final textSpan = TextSpan(
-        text: 'Created from DailyAL App',
-        style: TextStyle(
-          color: Colors.white,
-          fontSize: (footerHeight * 0.35).clamp(24.0, 100.0),
-          fontFamily: 'Roboto', // Default flutter font or app font
-          fontWeight: FontWeight.bold,
-        ),
-      );
-      final textPainter = TextPainter(
-        text: textSpan,
-        textDirection: TextDirection.ltr,
-      );
-      textPainter.layout();
-
-      final textX = logoX + logoSize + (40.0 * scaleFactor);
-      final textY = graphImage.height + (footerHeight - textPainter.height) / 2;
-
-      textPainter.paint(canvas, Offset(textX, textY));
-
-      // Finalize Image
-      final picture = recorder.endRecording();
-      final finalImage = await picture.toImage(totalWidth, totalHeight);
-
-      ByteData? byteData =
-          await finalImage.toByteData(format: ui.ImageByteFormat.png);
-      Uint8List pngBytes = byteData!.buffer.asUint8List();
+      final bytes = await graphImage.toByteData(format: ui.ImageByteFormat.png);
+      if (bytes == null) return;
 
       final tempDir = await getTemporaryDirectory();
-      final node = _nodeMap[widget.id];
-      final title =
-          node?.title?.replaceAll(RegExp(r'[^\w\s]+'), '') ?? 'anime_graph';
-      final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final fileName = '${title}_${widget.id}_$timestamp.png';
-
-      final file = await File('${tempDir.path}/$fileName').create();
-      await file.writeAsBytes(pngBytes);
-
+      final title = (_nodeMap[widget.id]?.title ?? 'anime_graph')
+          .replaceAll(RegExp(r'[^\\w\\s-]'), '')
+          .trim();
+      final fileName = '${title.isEmpty ? 'anime_graph' : title}_${widget.id}_${DateTime.now().millisecondsSinceEpoch}.png';
+      final file = File('${tempDir.path}/$fileName');
+      await file.writeAsBytes(bytes.buffer.asUint8List(), flush: true);
       await Share.shareXFiles([XFile(file.path)], text: fileName);
     } catch (e) {
       dal.logDal(e.toString());
       if (mounted) showToast(S.current.Couldnt_generate_graph);
-    }
-  }
-
-  void _onNodeSelect(dal.GraphNode a) {
-    if (a.id != null) {
-      _selectedId = a.id!;
-      _setInitialPosition();
-      if (mounted) setState(() {});
     }
   }
 }
