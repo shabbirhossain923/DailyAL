@@ -14,7 +14,6 @@ import 'package:dailyanimelist/widgets/selectbottom.dart';
 import 'package:dal_commons/commons.dart' as dal;
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
-import 'package:flutter/services.dart';
 import 'package:graphview/GraphView.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
@@ -204,12 +203,6 @@ class _AnimeGraphWidgetState extends State<AnimeGraphWidget> {
     } else {
       _graphController.jumpToNode(key);
     }
-  }
-
-  @override
-  void dispose() {
-    _graphController.resetView();
-    super.dispose();
   }
 
   @override
