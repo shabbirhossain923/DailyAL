@@ -434,7 +434,7 @@ class _AnimeGraphWidgetState extends State<AnimeGraphWidget> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        color: Theme.of(context).cardColor.withOpacity(.7),
         borderRadius: BorderRadius.circular(20),
       ),
       child: Text(text, style: const TextStyle(fontSize: 10)),
